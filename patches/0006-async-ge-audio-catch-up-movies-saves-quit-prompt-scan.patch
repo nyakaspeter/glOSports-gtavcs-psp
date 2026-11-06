@@ -1,0 +1,269 @@
+diff --git a/profiles/vcs/host/vcs_media_decoder.cpp b/profiles/vcs/host/vcs_media_decoder.cpp
+index d2d97e8..f5b59c3 100644
+--- a/profiles/vcs/host/vcs_media_decoder.cpp
++++ b/profiles/vcs/host/vcs_media_decoder.cpp
+@@ -75,6 +75,13 @@ struct DecodeCommon {
+             if (diag) std::fprintf(stderr, "[decode-diag] avcodec_parameters_to_context failed\n");
+             return false;
+         }
++        if (type == AVMEDIA_TYPE_VIDEO) {
++            // Frames decode on two FFmpeg threads while the game thread only
++            // hands over packets: decoding a frame inside sceMpegAvcDecode now
++            // and then missed the vblank, and the movie stuttered.
++            codec->thread_count = 2;
++            codec->thread_type = FF_THREAD_FRAME;
++        }
+         if (avcodec_open2(codec, decoder, nullptr) < 0) {
+             if (diag) std::fprintf(stderr, "[decode-diag] avcodec_open2 failed\n");
+             return false;
+diff --git a/profiles/vcs/host/vcs_profile.cpp b/profiles/vcs/host/vcs_profile.cpp
+index e2385f0..ef9db5c 100644
+--- a/profiles/vcs/host/vcs_profile.cpp
++++ b/profiles/vcs/host/vcs_profile.cpp
+@@ -170,8 +170,14 @@ struct VirtualDiscFile {
+     std::filesystem::path native_path;
+     std::uint32_t start_sector{};
+     std::uint64_t size{};
++    bool prompt_table{};  // the rewritten ENGLISH.GXT (keyboard/controller prompts)
+ };
+ 
++// Reads of the prompt table left to look for in guest RAM: searching all of
++// it takes 95 ms on a Cortex-A7, and searching every 120 vblanks until the
++// table turned up stalled the intro movies every 2 s.
++std::uint32_t prompt_table_scans_wanted = 0u;
++
+ struct VirtualDiscHandle {
+     std::uint64_t base_offset{};
+     std::uint64_t length{};
+@@ -570,6 +576,7 @@ const VirtualDiscFile *register_virtual_disc_file(const std::filesystem::path &p
+                 if (!patched_error && patched_size != 0u) {
+                     item.native_path = *patched;
+                     item_size = patched_size;
++                    item.prompt_table = true;
+                 }
+             }
+         }
+@@ -647,6 +654,7 @@ std::size_t read_virtual_disc(VirtualDiscHandle &handle, std::span<std::uint8_t>
+         }
+ 
+         if (file != nullptr && file_key != nullptr) {
++            if (file->prompt_table) prompt_table_scans_wanted = 5u;  // the game parses it over the next frames
+             const std::uint64_t file_start = static_cast<std::uint64_t>(file->start_sector) * 2048u;
+             const std::uint64_t file_offset = absolute - file_start;
+             const std::size_t chunk = static_cast<std::size_t>(std::min<std::uint64_t>(
+@@ -1252,6 +1260,11 @@ thread_local bool ge_async_worker_thread = false;
+ bool ge_async_enabled() noexcept {
+     static const bool enabled = [] {
+         const char *value = VCS_ENV("PSPRECOMP_GE_ASYNC");
++#if defined(VCS_GLES2_GE_BACKEND)
++        // GLES 2 on goodluckOS: 21.3/23.3 fps on vs 15.2 off (gameplay, the
++        // GE took 46 ms of the game thread's ~90 ms frame).
++        if (value == nullptr || *value == '\0') return true;
++#endif
+         if (value == nullptr || *value == '\0') return ge_gpu_backend_is_vulkan();
+         return std::strcmp(value, "0") != 0;
+     }();
+@@ -1518,7 +1531,7 @@ void dump_ram_if_requested(const psprecomp::GuestMemory &memory) {
+     std::filesystem::create_directories(config.directory);
+     std::ostringstream stem;
+     stem << "ram_vblank_" << std::setw(6) << std::setfill('0') << display_vblank_index;
+-    const auto write_bytes = [&](const std::filesystem::path &path, const std::vector<std::uint8_t> &bytes) {
++    const auto write_bytes = [&](const std::filesystem::path &path, std::span<const std::uint8_t> bytes) {  // spans since the fastmem window
+         std::ofstream output(path, std::ios::binary | std::ios::trunc);
+         if (!output) throw std::runtime_error("Unable to create RAM diagnostic dump: " + path.string());
+         output.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+@@ -2328,14 +2341,11 @@ std::string safe_savedata_component(std::string value) {
+ }
+ 
+ std::filesystem::path savedata_root(const psprecomp::Runtime &runtime) {
+-    // Beside the executable, not inside the game data. A player pointing the
+-    // runtime at an extracted disc should not have to dig through it to find
+-    // their progress, and that copy may well be read-only or shared between
+-    // builds. Falls back to the game root when the configuration has not been
+-    // initialized, which is only the case in tests.
+-    const ::vcs::VcsConfiguration &config = ::vcs::vcs_configuration();
+-    if (config.initialized && !config.executable_directory.empty())
+-        return config.executable_directory / "SAVEDATA";
++    // In the game files, where the game's own file calls see it too:
++    // ms0:PSP/SAVEDATA, which it lists at boot to load the save it finds
++    // (its "continue"). Next to the executable, as upstream keeps it, the
++    // boot found nothing and always started a new game. Same place as in
++    // ga36-lcs-recomp-port.
+     return runtime.game_root() / "PSP" / "SAVEDATA";
+ }
+ 
+@@ -2574,7 +2584,12 @@ std::uint64_t system_time_microseconds() {
+ std::uint32_t audio_remaining_samples(const AudioChannelState &channel) {
+     if (!channel.reserved || channel.busy_until_us <= virtual_time_us) return 0u;
+     const std::uint64_t remaining_us = channel.busy_until_us - virtual_time_us;
+-    const std::uint64_t samples = (remaining_us * 44100u + 999999u) / 1000000u;
++    // ceil(us * 44100 / 1000000) == ceil(us * 441 / 10000); the 32-bit form
++    // covers up to 9.7 s and avoids a 64-bit division (a libgcc call on
++    // 32-bit ARM) on a path the game polls often (ga36-lcs-recomp-port 0028).
++    const std::uint64_t samples = remaining_us < 9700000u
++        ? (static_cast<std::uint32_t>(remaining_us) * 441u + 9999u) / 10000u
++        : (remaining_us * 44100u + 999999u) / 1000000u;
+     return static_cast<std::uint32_t>(std::min<std::uint64_t>(samples, channel.sample_count));
+ }
+ 
+@@ -2602,10 +2617,15 @@ std::uint64_t audio_queue_buffer(AudioChannelState &channel, std::uint32_t frame
+         return (sample_frames * 1000000ull) / rate;
+     };
+     std::uint64_t start = channel.queue_anchor_us + elapsed_us(channel.queued_frames);
+-    if (!channel.queue_active || start < virtual_time_us) {
+-        // Either the first buffer of a stream, or the guest fell far enough
+-        // behind that the queue really did drain.  Both are genuine
+-        // discontinuities: restart the anchor here.
++    // A buffer due in the past is not a restart: when the limiter moves the
++    // guest clock past a slow frame, the audio thread wakes late and has to
++    // submit the buffers it missed back to back (wait 0) to keep real-time
++    // speed. Restarting here dropped that time: at 30 fps half the audio
++    // was never made (choppy, and drifting behind the picture). Only a gap
++    // longer than the host queue holds (a stream that really stopped) is a
++    // discontinuity.
++    constexpr std::uint64_t kAudioResyncUs = 250'000u;
++    if (!channel.queue_active || start + kAudioResyncUs < virtual_time_us) {
+         channel.queue_active = true;
+         channel.queue_anchor_us = virtual_time_us;
+         channel.queued_frames = 0u;
+@@ -4490,7 +4510,7 @@ void limit_frame_rate() {
+         }
+     }
+ 
+-    const auto target = wall_anchor + std::chrono::microseconds(virtual_time_us - guest_anchor);
++    auto target = wall_anchor + std::chrono::microseconds(virtual_time_us - guest_anchor);
+     const auto now = std::chrono::steady_clock::now();
+     if (now >= target) {
+         // The selected rate is a ceiling, not a promise that this renderer can
+@@ -4517,26 +4537,8 @@ void limit_frame_rate() {
+             const std::uint64_t cap = vblank_period * 4u;
+             const std::uint64_t jump = std::min(static_cast<std::uint64_t>(behind), cap);
+             virtual_time_us += jump;
+-            // Shift active audio channels' schedule anchors forward by a
+-            // stall's catch-up jump so a hitch doesn't leave the guest's
+-            // "now" (and whatever dialogue/lip-sync it drives) stepped ahead
+-            // of audio that is still correctly mid-playback of an earlier
+-            // moment -- confirmed directly: a 36ms GE stall measured right at
+-            // a reported desync, with audio otherwise proven gapless.
+-            //
+-            // Gated to jumps of at least a full vblank period. A first,
+-            // ungated version touched the anchor on every nonzero "behind",
+-            // which at a 120 Hz target is nearly every frame from ordinary
+-            // sub-frame present/GE variance, not just real stalls -- that
+-            // compounded far faster than intended and was a confirmed,
+-            // immediate regression (stuttering from the very start). A real
+-            // hitch worth correcting for is a multi-frame stall, not a few
+-            // hundred microseconds of routine jitter.
+-            if (jump >= vblank_period) {
+-                for (auto &channel : audio_channels) {
+-                    if (channel.queue_active) channel.queue_anchor_us += jump;
+-                }
+-            }
++            // The audio channels' schedules stay where they are: their
++            // threads catch up with the jump (see audio_queue_buffer).
+         }
+         wall_anchor = now;
+         guest_anchor = virtual_time_us;
+@@ -7418,8 +7420,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+                     const std::u16string &now = prompt_applied != 0 ? probe.pad : probe.keyboard;
+                     if (!units_match(prompt_base + probe.file_offset, now)) prompt_base = 0u;
+                 }
+-                if (prompt_base == 0u && display_vblank_index >= prompt_next_scan) {
++                if (prompt_base == 0u && prompt_table_scans_wanted != 0u && display_vblank_index >= prompt_next_scan) {
+                     prompt_next_scan = display_vblank_index + 120u;
++                    --prompt_table_scans_wanted;
+                     const std::vector<std::uint8_t> signature = vcs::vcs_prompt_signature();
+                     const vcs::PromptPatch *first = nullptr;
+                     for (const auto &patch : patches) if (patch.keyboard.size() >= 12u) { first = &patch; break; }
+@@ -7428,15 +7431,15 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+                         const std::uint8_t *ram = rt.memory().raw_pointer(kScanStart, kScanBytes);
+                         if (ram != nullptr) {
+                             const auto *sig_begin = reinterpret_cast<const std::uint8_t *>(signature.data());
+-                            const std::uint8_t *hit_it = std::search(ram, ram + kScanBytes, sig_begin, sig_begin + signature.size());
+-                            const std::uint8_t *hit = hit_it == ram + kScanBytes ? nullptr : hit_it;
++                            const auto *hit = static_cast<const std::uint8_t *>(
++                                memmem(ram, kScanBytes, sig_begin, signature.size()));
+                             if (hit != nullptr) {
+                                 const std::uint32_t candidate = kScanStart + static_cast<std::uint32_t>(hit - ram) - first->file_offset;
+                                 // Three more strings from across the table must line up before trusting it.
+                                 bool ok = true;
+                                 for (const std::size_t k : {patches.size() / 4u, patches.size() / 2u, (patches.size() * 3u) / 4u})
+                                     ok = ok && units_match(candidate + patches[k].file_offset, patches[k].keyboard);
+-                                if (ok) { prompt_base = candidate; prompt_applied = 0; }
++                                if (ok) { prompt_base = candidate; prompt_applied = 0; prompt_table_scans_wanted = 0u; }
+                             }
+                         }
+                     }
+@@ -7469,9 +7472,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+         // A movie frame is a finished 480x272 picture with no more image at the
+         // sides, so widening it can only stretch it. Present it black-barred at
+         // its own shape instead; gameplay keeps the widescreen treatment.
+-        display_window_set_aspect_lock(
+-            !movie_output_buffers.empty() &&
+-            movie_output_buffers.count(normalize_ram_address(display_state.frame_buffer)) != 0u);
++        const bool movie_frame = !movie_output_buffers.empty() &&
++            movie_output_buffers.count(normalize_ram_address(display_state.frame_buffer)) != 0u;
++        display_window_set_aspect_lock(movie_frame);
+         const auto present_entry = frame_time_diag_enabled()
+             ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+         const bool gpu_frame_ready = ge_gpu_backend_finish_color_frame(display_vblank_index);
+@@ -7495,7 +7498,12 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+             holding_gpu_frame = false;
+         }
+         bool presented_gpu_frame = false;
+-        if (ge_gpu_backend_presents_directly()) {
++        // Only movie frames come from guest memory; every other picture is the
++        // GPU's (the GE draws nothing into guest memory under GLES 2). A
++        // loading screen draws a frame every 5+ vblanks, and in between the
++        // guest's own 480 x 272 copy replaced it; skipping the credits showed
++        // a never-written buffer for a moment (a green flash).
++        if (ge_gpu_backend_presents_directly() || !movie_frame) {
+             // The backend blitted straight into the swapchain. Dropped vblanks
+             // simply leave the previous image on screen, which is the hold
+             // behaviour for free, and mixing a GDI blit into the same window
+@@ -7624,6 +7632,10 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+             } else if (savedata_utility.status == UtilityStatus::Visible && !savedata_utility.operation_complete) {
+                 const std::uint32_t result = execute_savedata_operation(rt, savedata_utility.parameter_address);
+                 rt.memory().store32(savedata_utility.parameter_address + kUtilityCommonResultOffset, result);
++                // One line per save or load: rare, and the first thing to look at when a save goes missing.
++                std::cerr << "[savedata] mode=" << rt.memory().load32(savedata_utility.parameter_address + kSavedataModeOffset)
++                          << " dir=" << savedata_directory(rt, savedata_utility.parameter_address).string()
++                          << " result=0x" << std::hex << result << std::dec << "\n";
+                 savedata_utility.operation_complete = true;
+                 savedata_utility.status = UtilityStatus::Quit;
+                 if (VCS_ENV("PSPRECOMP_TRACE") != nullptr) {
+@@ -9294,7 +9306,15 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+     runtime.register_hle("IoFileMgrForUser", 0xB29DDF9Cu,
+         [](psprecomp::Runtime &rt, psprecomp::AllegrexContext &ctx) {
+             try {
+-                const auto native = rt.translate_path(rt.memory().read_c_string(ctx.gpr[4]));
++                const std::string guest_path = rt.memory().read_c_string(ctx.gpr[4]);
++                // VCS_BENCH_NEW_GAME=1: the boot's continue finds no save, so the
++                // game plays its opening cutscene (the bench scene) with a save present.
++                static const bool bench_new_game = VCS_ENV("VCS_BENCH_NEW_GAME") != nullptr;
++                if (bench_new_game && guest_path.find("SAVEDATA") != std::string::npos) {
++                    ctx.set_gpr(2, 0x80010002u);
++                    return;
++                }
++                const auto native = rt.translate_path(guest_path);
+                 if (!std::filesystem::is_directory(native)) {
+                     ctx.set_gpr(2, 0x80010002u);
+                     return;
+@@ -9795,6 +9815,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+                 const std::size_t read = read_virtual_disc(
+                     virtual_handle->second,
+                     std::span<std::uint8_t>(guest_destination, static_cast<std::size_t>(size)));
++                // Written behind the guest memory's back: bump the page generations
++                // the palette and texture caches compare (ga36-lcs-recomp-port 0022).
++                rt.memory().touch_pages(dst, read);
+                 if (time_io) io_host_time_this_vblank += std::chrono::steady_clock::now() - io_entry;
+                 static const bool io_diag = VCS_ENV("PSPRECOMP_IO_DIAG") != nullptr;
+                 static const bool umd_stream_diag = VCS_ENV("PSPRECOMP_UMD_STREAM_DIAG") != nullptr;
+@@ -9859,6 +9882,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+             it->second.read(reinterpret_cast<char *>(guest_destination),
+                             static_cast<std::streamsize>(size));
+             const auto read = static_cast<std::size_t>(it->second.gcount());
++            rt.memory().touch_pages(dst, read);  // as the virtual-disc read above
+             if (time_io) io_host_time_this_vblank += std::chrono::steady_clock::now() - io_entry;
+             ctx.set_gpr(2, static_cast<std::uint32_t>(read));
+         });

@@ -1,0 +1,18 @@
+diff --git a/profiles/vcs/host/ge_renderer.cpp b/profiles/vcs/host/ge_renderer.cpp
+index 6c0da0e..b547aa7 100644
+--- a/profiles/vcs/host/ge_renderer.cpp
++++ b/profiles/vcs/host/ge_renderer.cpp
+@@ -39,6 +39,13 @@
+ #if defined(__aarch64__) || defined(__ARM_NEON) || defined(_M_ARM64)
+ #include <arm_neon.h>
+ #define PSPRECOMP_GE_ARM_SIMD 1
++// 32-bit ARM NEON has no fused multiply-add by scalar; the separate multiply
++// and add give the same results as the scalar path built without contraction.
++#if !defined(__aarch64__) && !defined(_M_ARM64)
++static inline float32x4_t vfmaq_n_f32(float32x4_t a, float32x4_t b, float c) noexcept {
++    return vmlaq_n_f32(a, b, c);
++}
++#endif
+ #else
+ #define PSPRECOMP_GE_ARM_SIMD 0
+ #endif

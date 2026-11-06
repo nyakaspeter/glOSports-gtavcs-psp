@@ -1,0 +1,1321 @@
+diff --git a/profiles/vcs/CMakeLists.txt b/profiles/vcs/CMakeLists.txt
+index 8c5bb5d..48d4c51 100644
+--- a/profiles/vcs/CMakeLists.txt
++++ b/profiles/vcs/CMakeLists.txt
+@@ -71,7 +71,7 @@ if(MSVC AND NOT VCS_CLANG_AOT)
+         "${VCS_GENERATED_MSVC_OPTIONS}")
+ else()
+     set_source_files_properties(${VCS_GENERATED} PROPERTIES COMPILE_OPTIONS
+-        "-O${PSPRECOMP_GENERATED_OPT_LEVEL};-g0")
++        "-O${PSPRECOMP_GENERATED_OPT_LEVEL};-g0;-fno-exceptions;-fno-unwind-tables;-fno-asynchronous-unwind-tables")
+ endif()
+ 
+ if(PSPRECOMP_PROFILE_GUIDED_AOT AND NOT VCS_CLANG_AOT)
+diff --git a/profiles/vcs/tools/vcs_codegen_main.cpp b/profiles/vcs/tools/vcs_codegen_main.cpp
+index c53f44a..0e3d1a8 100644
+--- a/profiles/vcs/tools/vcs_codegen_main.cpp
++++ b/profiles/vcs/tools/vcs_codegen_main.cpp
+@@ -21,6 +21,7 @@
+ #include <string_view>
+ #include <set>
+ #include <sstream>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace {
+@@ -84,10 +85,59 @@ std::string reg(std::uint32_t index) {
+     return "ctx.gpr[" + std::to_string(index) + "]";
+ }
+ 
+-std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t pc) {
++// VFPU prefixes known at generation time. A `vpfx` sets one; the next VFPU
++// instruction consumes all three. In every corpus seen so far the consumer is
++// in the same basic block (checked by prefixes_fold_safely() before emission),
++// so the generator knows the exact prefixes of every VFPU instruction: with
++// the defaults it emits the plain lane accessors (no run-time decode, no
++// vfpu_ctrl traffic), otherwise it stores the literals and emits the
++// run-time-prefixed form, which resets them. vfpu_ctrl[0..2] therefore hold
++// the defaults between instructions, which is what the run-time forms assume.
++struct PrefixState {
++    static constexpr std::uint32_t kDefaultSource = 0xE4u;
++    std::uint32_t s{kDefaultSource};
++    std::uint32_t t{kDefaultSource};
++    std::uint32_t d{0u};
++    bool enabled{true};
++    [[nodiscard]] bool defaults() const noexcept { return s == kDefaultSource && t == kDefaultSource && d == 0u; }
++    [[nodiscard]] bool pending() const noexcept { return !defaults(); }
++    void reset() noexcept { s = kDefaultSource; t = kDefaultSource; d = 0u; }
++    // The stores a run-time-prefixed consumer needs before it runs.
++    [[nodiscard]] std::string materialize() const {
++        std::string out;
++        if (s != kDefaultSource) out += "    ctx.vfpu_ctrl[0u] = " + psprecomp::hex32(s) + "u;\n";
++        if (t != kDefaultSource) out += "    ctx.vfpu_ctrl[1u] = " + psprecomp::hex32(t) + "u;\n";
++        if (d != 0u) out += "    ctx.vfpu_ctrl[2u] = " + psprecomp::hex32(d) + "u;\n";
++        return out;
++    }
++};
++
++bool consumes_vfpu_prefixes(psprecomp::OpcodeKind kind) {
++    using K = psprecomp::OpcodeKind;
++    switch (kind) {
++    case K::Viim: case K::Vfim: case K::Vh2f: case K::Vf2h: case K::Vf2i: case K::Vi2f: case K::Vx2i:
++    case K::VmidT: case K::Vmmov: case K::VfpuMatrixInit: case K::Vidt: case K::Vcst: case K::Vocp:
++    case K::VfpuHorizontal: case K::Vrot: case K::Vtfm: case K::VfpuVectorInit: case K::VfpuVec3:
++    case K::Vscl: case K::Vdot: case K::Vhdp: case K::Vcmp: case K::Vminmax: case K::VfpuCompare3:
++    case K::Vcmov: case K::VfpuUnary: case K::Vmmul: case K::Vmscl: case K::VcrossQuat:
++        return true;
++    default:
++        return false;
++    }
++}
++
++std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t pc, PrefixState &prefix) {
+     const auto imm = static_cast<std::int32_t>(d.immediate);
+     const auto uimm = static_cast<std::uint16_t>(d.immediate);
+     std::ostringstream out;
++    // Run-time-prefixed VFPU forms need the literals in vfpu_ctrl first; the
++    // folded forms below are emitted instead when every prefix is the default.
++    const bool fold = prefix.enabled && prefix.defaults();
++    if (consumes_vfpu_prefixes(d.kind) && !fold) out << prefix.materialize();
++    struct ConsumeGuard {
++        PrefixState &state; bool active;
++        ~ConsumeGuard() { if (active) state.reset(); }
++    } consume_guard{prefix, consumes_vfpu_prefixes(d.kind)};
+     switch (d.kind) {
+     case psprecomp::OpcodeKind::Nop: out << "    // nop\n"; break;
+     case psprecomp::OpcodeKind::Break:
+@@ -261,9 +311,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         out << "    ctx.fpr[" << d.sa << "] = ctx.fpr[" << d.rd << "] - ctx.fpr[" << d.rt << "];\n";
+         break;
+     case psprecomp::OpcodeKind::MulS:
+-        out << "    { const float fs = ctx.fpr[" << d.rd << "]; const float ft = ctx.fpr[" << d.rt << "]; "
+-            << "if ((std::isinf(fs) && ft == 0.0f) || (std::isinf(ft) && fs == 0.0f)) ctx.set_fpr_bits(" << d.sa << ", 0x7FC00000u); "
+-            << "else ctx.fpr[" << d.sa << "] = fs * ft; }\n";
++        out << "    ctx.fpr[" << d.sa << "] = psprecomp::AllegrexContext::fpu_mul(ctx.fpr[" << d.rd << "], ctx.fpr[" << d.rt << "]);\n";
+         break;
+     case psprecomp::OpcodeKind::DivS:
+         out << "    ctx.fpr[" << d.sa << "] = ctx.fpr[" << d.rd << "] / ctx.fpr[" << d.rt << "];\n";
+@@ -320,6 +368,9 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+     case psprecomp::OpcodeKind::Vflush:
+         if ((d.word & 0xFFFF0000u) == 0xFFFF0000u) {
+             out << "    // vflush: architectural no-op that retains VFPU prefixes\n";
++        } else if (prefix.enabled) {
++            out << "    // vflush: VFPU sync/no-op consumes prefixes\n";
++            prefix.reset();
+         } else {
+             out << "    ctx.eat_vfpu_prefixes(); // VFPU sync/no-op consumes prefixes\n";
+         }
+@@ -328,14 +379,21 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t control = (d.word >> 24u) & 3u;
+         std::uint32_t data = d.word & 0x000FFFFFu;
+         if (control == 2u) data &= 0x00000FFFu;
+-        out << "    ctx.vfpu_ctrl[" << control << "u] = " << psprecomp::hex32(data) << "u;\n";
++        if (prefix.enabled) {
++            if (control == 0u) prefix.s = data;
++            else if (control == 1u) prefix.t = data;
++            else if (control == 2u) prefix.d = data;
++            out << "    // vpfx " << control << " = " << psprecomp::hex32(data) << " (folded into the next VFPU op)\n";
++        } else {
++            out << "    ctx.vfpu_ctrl[" << control << "u] = " << psprecomp::hex32(data) << "u;\n";
++        }
+         break;
+     }
+     case psprecomp::OpcodeKind::Viim: {
+         const std::uint32_t destination = (d.word >> 16u) & 0x7Fu;
+         const std::int32_t immediate = static_cast<std::int16_t>(d.word & 0xFFFFu);
+         out << "    { const float vfpu_value[1]{static_cast<float>(" << immediate << ")};\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_value, " << destination << "u, 1u); }\n";
++            << "      ctx." << (fold ? "write_vfpu_vector" : "write_vfpu_vector_with_destination_prefix") << "(vfpu_value, " << destination << "u, 1u); }\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::Vfim: {
+@@ -360,7 +418,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+             << "        vfpu_bits = vfpu_sign | ((vfpu_exponent + 112u) << 23u) | (vfpu_mantissa << 13u);\n"
+             << "      }\n"
+             << "      const float vfpu_value[1]{std::bit_cast<float>(vfpu_bits)};\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_value, " << destination << "u, 1u); }\n";
++            << "      ctx." << (fold ? "write_vfpu_vector" : "write_vfpu_vector_with_destination_prefix") << "(vfpu_value, " << destination << "u, 1u); }\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::Vf2h: {
+@@ -390,7 +448,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t mode = (d.word >> 21u) & 31u;
+         out << "    { float vfpu_s[4]{}; std::int32_t vfpu_d[4]{};\n"
+             << "      ctx.read_vfpu_vector(vfpu_s, " << source << "u, " << length << "u);\n"
+-            << "      ctx.apply_vfpu_source_prefix(vfpu_s, " << length << "u, 0u);\n"
++            << (fold ? "" : "      ctx.apply_vfpu_source_prefix(vfpu_s, " + std::to_string(length) + "u, 0u);\n")
+             << "      const float vfpu_scale = std::ldexp(1.0f, static_cast<int>(" << immediate << "u));\n"
+             << "      for (std::uint32_t vfpu_i = 0; vfpu_i < " << length << "u; ++vfpu_i) {\n"
+             << "        if (std::isnan(vfpu_s[vfpu_i])) { vfpu_d[vfpu_i] = std::numeric_limits<std::int32_t>::max(); continue; }\n"
+@@ -407,12 +465,15 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+             << "          vfpu_d[vfpu_i] = static_cast<std::int32_t>(vfpu_rounded);\n"
+             << "        }\n"
+             << "      }\n"
+-            << "      const std::uint32_t vfpu_destination_prefix = ctx.vfpu_ctrl[2];\n"
+-            << "      for (std::uint32_t vfpu_i = 0; vfpu_i < " << length << "u; ++vfpu_i) {\n"
+-            << "        if (((vfpu_destination_prefix >> (8u + vfpu_i)) & 1u) == 0u)\n"
+-            << "          ctx.vfpu[psprecomp::AllegrexContext::vfpu_vector_lane_index(" << destination << "u, " << length << "u, vfpu_i)] = std::bit_cast<float>(static_cast<std::uint32_t>(vfpu_d[vfpu_i]));\n"
+-            << "      }\n"
+-            << "      ctx.eat_vfpu_prefixes(); }\n";
++            << (fold
++                ? "      float vfpu_f[4]{}; for (std::uint32_t vfpu_i = 0; vfpu_i < " + std::to_string(length) + "u; ++vfpu_i) vfpu_f[vfpu_i] = std::bit_cast<float>(static_cast<std::uint32_t>(vfpu_d[vfpu_i]));\n"
++                  "      ctx.write_vfpu_vector(vfpu_f, " + std::to_string(destination) + "u, " + std::to_string(length) + "u); }\n"
++                : "      const std::uint32_t vfpu_destination_prefix = ctx.vfpu_ctrl[2];\n"
++                  "      for (std::uint32_t vfpu_i = 0; vfpu_i < " + std::to_string(length) + "u; ++vfpu_i) {\n"
++                  "        if (((vfpu_destination_prefix >> (8u + vfpu_i)) & 1u) == 0u)\n"
++                  "          ctx.vfpu[psprecomp::AllegrexContext::vfpu_vector_lane_index(" + std::to_string(destination) + "u, " + std::to_string(length) + "u, vfpu_i)] = std::bit_cast<float>(static_cast<std::uint32_t>(vfpu_d[vfpu_i]));\n"
++                  "      }\n"
++                  "      ctx.eat_vfpu_prefixes(); }\n");
+         break;
+     }
+     case psprecomp::OpcodeKind::Vi2f: {
+@@ -423,13 +484,13 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t immediate = (d.word >> 16u) & 31u;
+         out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
+             << "      ctx.read_vfpu_vector(vfpu_s, " << source << "u, " << length << "u);\n"
+-            << "      ctx.apply_vfpu_source_prefix(vfpu_s, " << length << "u, 0u);\n"
++            << (fold ? "" : "      ctx.apply_vfpu_source_prefix(vfpu_s, " + std::to_string(length) + "u, 0u);\n")
+             << "      const float vfpu_scale = std::ldexp(1.0f, -static_cast<int>(" << immediate << "u));\n"
+             << "      for (std::uint32_t vfpu_i = 0; vfpu_i < " << length << "u; ++vfpu_i) {\n"
+             << "        const auto vfpu_integer = static_cast<std::int32_t>(std::bit_cast<std::uint32_t>(vfpu_s[vfpu_i]));\n"
+             << "        vfpu_d[vfpu_i] = static_cast<float>(vfpu_integer) * vfpu_scale;\n"
+             << "      }\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << length << "u); }\n";
++            << "      ctx." << (fold ? "write_vfpu_vector" : "write_vfpu_vector_with_destination_prefix") << "(vfpu_d, " << destination << "u, " << length << "u); }\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::Vx2i: {
+@@ -479,7 +540,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t offset_mask = length >= 3u ? 3u : 1u;
+         const std::uint32_t one_lane = destination & offset_mask;
+         out << "    { float vfpu_value[4]{}; vfpu_value[" << one_lane << "u] = 1.0f;\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_value, " << destination
++            << "      ctx." << (fold ? "write_vfpu_vector" : "write_vfpu_vector_with_destination_prefix") << "(vfpu_value, " << destination
+             << "u, " << length << "u); }\n";
+         break;
+     }
+@@ -520,7 +581,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t destination = d.word & 0x7Fu;
+         const bool one = (((d.word >> 16u) & 31u) == 7u);
+         out << "    { float vfpu_value[4]{" << (one ? "1.0f, 1.0f, 1.0f, 1.0f" : "") << "};\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_value, " << destination
++            << "      ctx." << (fold ? "write_vfpu_vector" : "write_vfpu_vector_with_destination_prefix") << "(vfpu_value, " << destination
+             << "u, " << length << "u); }\n";
+         break;
+     }
+@@ -595,11 +656,19 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+                                : operation == 1u ? "vfpu_s[i] - vfpu_t[i]"
+                                : operation == 2u ? "vfpu_s[i] * vfpu_t[i]"
+                                                  : "vfpu_s[i] / vfpu_t[i]";
+-        out << "    { float vfpu_s[4]{}, vfpu_t[4]{}, vfpu_d[4]{};\n"
+-            << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
+-            << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_t, " << target << "u, " << length << "u, 1u);\n"
+-            << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = " << expression << ";\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << length << "u); }\n";
++        if (fold) {
++            out << "    { float vfpu_s[4]{}, vfpu_t[4]{}, vfpu_d[4]{};\n"
++                << "      ctx.read_vfpu_vector(vfpu_s, " << source << "u, " << length << "u);\n"
++                << "      ctx.read_vfpu_vector(vfpu_t, " << target << "u, " << length << "u);\n"
++                << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = " << expression << ";\n"
++                << "      ctx.write_vfpu_vector(vfpu_d, " << destination << "u, " << length << "u); }\n";
++        } else {
++            out << "    { float vfpu_s[4]{}, vfpu_t[4]{}, vfpu_d[4]{};\n"
++                << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
++                << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_t, " << target << "u, " << length << "u, 1u);\n"
++                << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = " << expression << ";\n"
++                << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << length << "u); }\n";
++        }
+         break;
+     }
+     case psprecomp::OpcodeKind::Vdot: {
+@@ -608,8 +677,12 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t destination = d.word & 0x7Fu;
+         const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+         const std::uint32_t target = (d.word >> 16u) & 0x7Fu;
+-        out << "    ctx.execute_vfpu_vdot(" << destination << "u, " << source << "u, "
+-            << target << "u, " << length << "u);\n";
++        if (fold)
++            out << "    ctx.execute_vfpu_vdot_ct<" << destination << "u, " << source << "u, "
++                << target << "u, " << length << "u, false>();\n";
++        else
++            out << "    ctx.execute_vfpu_vdot(" << destination << "u, " << source << "u, "
++                << target << "u, " << length << "u);\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::Vhdp: {
+@@ -660,8 +733,12 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+         const std::uint32_t target = (d.word >> 16u) & 0x7Fu;
+         const std::uint32_t condition = d.word & 15u;
+-        out << "    ctx.execute_vfpu_vcmp(" << source << "u, " << target << "u, "
+-            << length << "u, " << condition << "u);\n";
++        if (fold)
++            out << "    ctx.execute_vfpu_vcmp_ct<" << source << "u, " << target << "u, "
++                << length << "u, " << condition << "u, false>();\n";
++        else
++            out << "    ctx.execute_vfpu_vcmp(" << source << "u, " << target << "u, "
++                << length << "u, " << condition << "u);\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::Vcmov: {
+@@ -671,9 +748,14 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+         const std::uint32_t condition_index = (d.word >> 16u) & 7u;
+         const bool move_if_false = ((d.word >> 19u) & 1u) != 0u;
+-        out << "    ctx.execute_vfpu_vcmov(" << destination << "u, " << source << "u, "
+-            << length << "u, " << condition_index << "u, "
+-            << (move_if_false ? "true" : "false") << ");\n";
++        if (fold)
++            out << "    ctx.execute_vfpu_vcmov_ct<" << destination << "u, " << source << "u, "
++                << length << "u, " << condition_index << "u, "
++                << (move_if_false ? "true" : "false") << ", false>();\n";
++        else
++            out << "    ctx.execute_vfpu_vcmov(" << destination << "u, " << source << "u, "
++                << length << "u, " << condition_index << "u, "
++                << (move_if_false ? "true" : "false") << ");\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::Vscl: {
+@@ -682,8 +764,12 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         const std::uint32_t destination = d.word & 0x7Fu;
+         const std::uint32_t source = (d.word >> 8u) & 0x7Fu;
+         const std::uint32_t target = (d.word >> 16u) & 0x7Fu;
+-        out << "    ctx.execute_vfpu_vscl(" << destination << "u, " << source << "u, "
+-            << target << "u, " << length << "u);\n";
++        if (fold)
++            out << "    ctx.execute_vfpu_vscl_ct<" << destination << "u, " << source << "u, "
++                << target << "u, " << length << "u, false>();\n";
++        else
++            out << "    ctx.execute_vfpu_vscl(" << destination << "u, " << source << "u, "
++                << target << "u, " << length << "u);\n";
+         break;
+     }
+     case psprecomp::OpcodeKind::VfpuUnary: {
+@@ -711,10 +797,17 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         case 26u: expression = "-std::sin(vfpu_s[i] * 1.57079632679489661923f)"; break;
+         default: expression = "1.0f / std::exp2(vfpu_s[i])"; break;
+         }
+-        out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
+-            << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
+-            << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = " << expression << ";\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << length << "u); }\n";
++        if (fold) {
++            out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
++                << "      ctx.read_vfpu_vector(vfpu_s, " << source << "u, " << length << "u);\n"
++                << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = " << expression << ";\n"
++                << "      ctx.write_vfpu_vector(vfpu_d, " << destination << "u, " << length << "u); }\n";
++        } else {
++            out << "    { float vfpu_s[4]{}, vfpu_d[4]{};\n"
++                << "      ctx.read_vfpu_vector_with_source_prefix(vfpu_s, " << source << "u, " << length << "u, 0u);\n"
++                << "      for (std::uint32_t i = 0; i < " << length << "u; ++i) vfpu_d[i] = " << expression << ";\n"
++                << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_d, " << destination << "u, " << length << "u); }\n";
++        }
+         break;
+     }
+     case psprecomp::OpcodeKind::Vcst: {
+@@ -733,7 +826,7 @@ std::string emit_regular(const psprecomp::DecodedInstruction &d, std::uint32_t p
+         out << "    { const float vfpu_constant = std::bit_cast<float>("
+             << psprecomp::hex32(constant_bits[selector]) << "u);\n"
+             << "      const float vfpu_value[4]{vfpu_constant, vfpu_constant, vfpu_constant, vfpu_constant};\n"
+-            << "      ctx.write_vfpu_vector_with_destination_prefix(vfpu_value, " << destination
++            << "      ctx." << (fold ? "write_vfpu_vector" : "write_vfpu_vector_with_destination_prefix") << "(vfpu_value, " << destination
+             << "u, " << length << "u); }\n";
+         break;
+     }
+@@ -852,11 +945,60 @@ std::string direct_unit_chain_expression(
+         if (found != direct_entry_ids->end() && found->second != 0u) {
+             return "rt.invoke_chained_direct<&" + generated_unit_cpp_entry_name(unit) + ", " +
+                 std::to_string(unit) + "u, " + std::to_string(found->second) + "u, " +
+-                psprecomp::hex32(target) + "u>(ctx, &aot_mem)";
++                psprecomp::hex32(target) + "u>(ctx, &aot_mem_ref)";
+         }
+     }
+     return "rt.invoke_chained_direct<&" + generated_unit_cpp_name(unit) + ", " +
+-        std::to_string(unit) + "u>(ctx, &aot_mem)";
++        std::to_string(unit) + "u>(ctx, &aot_mem_ref)";
++}
++
++// Leaf functions (--leaf-functions): a well-formed guest routine that makes no
++// calls is emitted as its own host function instead of as blocks of its 16 KB
++// unit, so a `jal` to it is one direct call with no entry switch and no local
++// dispatch on return.  The name is derived from the entry PC like the labels.
++std::string leaf_cpp_name(std::uint32_t entry) {
++    return "recomp_leaf_" + psprecomp::hex32(entry).substr(2);
++}
++
++// Call-site shape identical to the cross-unit chain: the unit index keeps the
++// poison test on the covering unit, the entry id is the leaf entry's id in that
++// unit (used only when the chain has to fall back to the unit's dispatcher).
++std::string leaf_chain_expression(
++    std::uint32_t unit, std::uint32_t target,
++    const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids) {
++    std::uint16_t entry_id = 0u;
++    if (direct_entry_ids != nullptr) {
++        const auto found = direct_entry_ids->find(target);
++        if (found != direct_entry_ids->end()) entry_id = found->second;
++    }
++    return "rt.invoke_chained_direct<&" + leaf_cpp_name(target) + ", " +
++        std::to_string(unit) + "u, " + std::to_string(entry_id) + "u, " +
++        psprecomp::hex32(target) + "u>(ctx, &aot_mem_ref)";
++}
++
++// Call functions (--call-functions): a well-formed guest routine that does
++// make calls is emitted as its own host function as well.  It is entered at
++// its entry (entry id 0) or, when the dispatcher or a chain fallback resumes
++// it after an unwind, at one of its continuations: the label after each
++// jal/jalr, ids 1..N in address order.
++std::string call_function_cpp_name(std::uint32_t entry) {
++    return "recomp_fn_" + psprecomp::hex32(entry).substr(2);
++}
++
++// A `jal` to a call function enters it at id 0.  The unit index keeps the
++// poison test and the fallbacks on the covering unit (which forwards the
++// entry PC and every continuation PC to the function), as for a leaf.
++std::string call_function_chain_expression(std::uint32_t unit, std::uint32_t target) {
++    return "rt.invoke_chained_direct<&" + call_function_cpp_name(target) + ", " +
++        std::to_string(unit) + "u, 0u, " + psprecomp::hex32(target) + "u>(ctx, &aot_mem_ref)";
++}
++
++// Units that exist (set by generate_auto): a fixed edge into an address no
++// unit covers (data, or code past the generated range) goes through the
++// dispatcher instead of naming a recomp_unit_N that was never emitted.
++const std::set<std::uint32_t> *g_valid_units = nullptr;
++bool unit_exists(std::uint32_t unit) {
++    return g_valid_units == nullptr || g_valid_units->contains(unit);
+ }
+ 
+ void emit_target(std::ostringstream &body, std::uint32_t target,
+@@ -885,13 +1027,14 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
+     // chain table and indexes the tiny unit table instead. A bucket containing
+     // an import/HLE/host replacement is marked overridden at registration time
+     // and invoke_chained_unit() falls back to the exact per-PC lookup there.
+-    if (unit_span_bytes != 0u && target >= executable_base) {
++    if (unit_span_bytes != 0u && target >= executable_base &&
++        unit_exists((target - executable_base) / unit_span_bytes)) {
+         const std::uint32_t unit = (target - executable_base) / unit_span_bytes;
+         body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
+              << "; return;\n";
+     } else {
+         body << indent << "ctx.pc = " << psprecomp::hex32(target)
+-             << "u; (void)rt.invoke_chained_call(ctx, &aot_mem); return;\n";
++             << "u; (void)rt.invoke_chained_call(ctx, &aot_mem_ref); return;\n";
+     }
+ }
+ 
+@@ -905,8 +1048,63 @@ struct GeneratedFunctionInput {
+     std::uint32_t unit_span_bytes{};
+     const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids{};
+     const std::set<std::uint32_t> *import_stubs{};
++    bool fold_vfpu_prefixes{};
++    // --leaf-functions.  id_labels: the unit's entry labels before any leaf
++    // region was removed; the dense entry ids and the kEntryIds_ table are
++    // numbered over this set so that every id a call site carries stays
++    // valid (null: entry_labels).  leaf_entries: every leaf entry PC in the
++    // program with its host function name; a `jal` to one becomes a direct
++    // leaf call and a dispatcher entry at one (an id_labels member that is not
++    // in entry_labels) forwards to the leaf.  leaf: emit this input as a leaf
++    // function (no entry switch, `jr $ra` stores ctx.pc and returns).
++    const std::set<std::uint32_t> *id_labels{};
++    const std::map<std::uint32_t, std::string> *leaf_entries{};
++    bool leaf{};
++    // --call-functions.  call_entries: every call function's entry PC with its
++    // host function name; a `jal` to one becomes a direct call at entry id 0.
++    // call_forwards: the forwarding statement of every call function entry
++    // and continuation PC (id_labels members that left the unit's blocks).
++    // call_function: emit this input as a call function; continuations: its
++    // continuation labels, entry id = position + 1.
++    const std::map<std::uint32_t, std::string> *call_entries{};
++    const std::map<std::uint32_t, std::string> *call_forwards{};
++    bool call_function{};
++    const std::vector<std::uint32_t> *continuations{};
+ };
+ 
++// True when every `vpfx` in the program is consumed by a VFPU instruction in
++// its own basic block, so the generator can fold prefixes at compile time.
++// A prefix that survives a block boundary (none seen in practice) would need
++// the run-time vfpu_ctrl forms everywhere, so one such site disables folding.
++bool prefixes_fold_safely(const psprecomp::GuestMemory &memory,
++                          const std::set<std::uint32_t> &instructions,
++                          const std::set<std::uint32_t> &entry_labels,
++                          std::uint32_t &offending_pc) {
++    for (const auto block_start : entry_labels) {
++        bool pending = false;
++        std::uint32_t pending_pc = 0u;
++        std::uint32_t pc = block_start;
++        auto note = [&](const psprecomp::DecodedInstruction &d, std::uint32_t at) {
++            if (d.kind == psprecomp::OpcodeKind::Vpfx) { pending = true; pending_pc = at; }
++            else if (consumes_vfpu_prefixes(d.kind)) pending = false;
++            else if (d.kind == psprecomp::OpcodeKind::Vflush && (d.word & 0xFFFF0000u) != 0xFFFF0000u) pending = false;
++        };
++        while (instructions.contains(pc)) {
++            if (pc != block_start && entry_labels.contains(pc)) break;
++            const auto decoded = psprecomp::decode_allegrex(memory.load32(pc));
++            note(decoded, pc);
++            if (decoded.has_delay_slot()) {
++                const auto slot = psprecomp::decode_allegrex(memory.load32(pc + 4u));
++                note(slot, pc + 4u);
++                break;
++            }
++            pc += 4u;
++        }
++        if (pending) { offending_pc = pending_pc; return false; }
++    }
++    return true;
++}
++
+ std::string emit_function_source(const GeneratedFunctionInput &function,
+                                  const psprecomp::GuestMemory &memory,
+                                  const std::string &cpp_name) {
+@@ -920,19 +1118,67 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+     // The guarded offset/alignment test keeps the accepted PC set identical to
+     // the exact comparisons it replaces.
+     constexpr std::uint64_t kMaximumDenseSlots = 8192u;
+-    const bool dense_dispatch = !function.entry_labels.empty() &&
+-        (static_cast<std::uint64_t>(*function.entry_labels.rbegin() - *function.entry_labels.begin()) / 4u + 1u)
++    // Entry ids are numbered over id_labels (the unit's entries before leaf
++    // regions were removed, see GeneratedFunctionInput), so removing a region
++    // changes no id that another unit's call site carries.
++    const std::set<std::uint32_t> &id_labels =
++        function.id_labels != nullptr ? *function.id_labels : function.entry_labels;
++    const bool dense_dispatch = !id_labels.empty() &&
++        (static_cast<std::uint64_t>(*id_labels.rbegin() - *id_labels.begin()) / 4u + 1u)
+             <= kMaximumDenseSlots;
+-    const std::uint32_t dense_base = function.entry_labels.empty() ? 0u : *function.entry_labels.begin();
+-    const std::uint32_t dense_span = function.entry_labels.empty()
++    const std::uint32_t dense_base = id_labels.empty() ? 0u : *id_labels.begin();
++    const std::uint32_t dense_span = id_labels.empty()
+         ? 0u
+-        : (*function.entry_labels.rbegin() - dense_base) + 4u;
++        : (*id_labels.rbegin() - dense_base) + 4u;
+     const std::string table_name = "kEntryIds_" + cpp_name;
++    // One switch arm per id: a block of this unit, a forward to a leaf function
++    // whose entry this is, or nothing (a leaf's inner block: never an entry).
++    const auto emit_case_target = [&](std::uint32_t label) -> std::string {
++        if (function.entry_labels.contains(label))
++            return "goto L_" + psprecomp::hex32(label).substr(2) + ";";
++        if (function.leaf_entries != nullptr) {
++            const auto leaf = function.leaf_entries->find(label);
++            if (leaf != function.leaf_entries->end())
++                return leaf->second + "(rt, ctx, aot_mem_ref); return;";
++        }
++        if (function.call_forwards != nullptr) {
++            const auto forward = function.call_forwards->find(label);
++            if (forward != function.call_forwards->end()) return forward->second;
++        }
++        return {};
++    };
+ 
+-    if (dense_dispatch) {
++    if (function.leaf) {
++        // A leaf: entered only at its entry (first block below), no dispatch.
++        body << "void " << cpp_name << "(Runtime &rt, AllegrexContext &ctx, GuestMemory::AotFastView &aot_mem_ref) {\n"
++                "    // A local copy of the view: its address never escapes, so stores through\n"
++                "    // the window cannot alias it and its pointers stay in registers.\n"
++                "    GuestMemory::AotFastView aot_mem = aot_mem_ref;\n"
++                "    std::uint32_t jump_target = 0u;\n"
++                "    (void)rt; (void)aot_mem; (void)jump_target;\n";
++    } else if (function.call_function) {
++        // A call function: id 0 falls into the entry block (first below); a
++        // continuation id is the resumption after an unwind out of one of its
++        // calls (the covering unit forwards that PC here).  No ctx.pc-based
++        // dispatch, no local transfers: `jr $ra` stores ctx.pc and returns.
++        body << "void " << cpp_name << "(Runtime &rt, AllegrexContext &ctx, std::uint16_t entry_id, GuestMemory::AotFastView &aot_mem_ref) {\n"
++                "    // A local copy of the view: its address never escapes, so stores through\n"
++                "    // the window cannot alias it and its pointers stay in registers.\n"
++                "    GuestMemory::AotFastView aot_mem = aot_mem_ref;\n"
++                "    std::uint32_t jump_target = 0u;\n"
++                "    (void)rt; (void)aot_mem; (void)jump_target;\n"
++                "    if (entry_id != 0u) [[unlikely]] {\n"
++                "        switch (entry_id) {\n";
++        std::uint32_t id = 1u;
++        for (const auto label : *function.continuations)
++            body << "        case " << id++ << "u: goto L_" << psprecomp::hex32(label).substr(2) << ";\n";
++        body << "        default: rt.unsupported(ctx.pc, 0u, \"invalid function entry\"); return;\n"
++                "        }\n"
++                "    }\n";
++    } else if (dense_dispatch) {
+         std::map<std::uint32_t, std::uint32_t> id_by_label;
+         std::uint32_t next_id = 1u;
+-        for (const auto label : function.entry_labels) id_by_label[label] = next_id++;
++        for (const auto label : id_labels) id_by_label[label] = next_id++;
+ 
+         body << "static const std::uint16_t " << table_name << "[" << (dense_span / 4u) << "] = {";
+         for (std::uint32_t offset = 0u; offset < dense_span; offset += 4u) {
+@@ -942,7 +1188,10 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+         }
+         body << "\n};\n";
+ 
+-        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem) {\n"
++        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem_ref) {\n"
++                "    // A local copy of the view: its address never escapes, so stores through\n"
++                "    // the window cannot alias it and its pointers stay in registers.\n"
++                "    GuestMemory::AotFastView aot_mem = aot_mem_ref;\n"
+              << "    std::uint32_t jump_target = 0u;\n"
+              << "    std::uint32_t local_transfers = 0u;\n"
+              << "    std::uint32_t local_pc = ctx.pc;\n"
+@@ -955,9 +1204,10 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+              << "u && (entry_delta & 3u) == 0u) ? " << table_name << "[entry_delta >> 2u] : 0u;\n"
+              << "    }\n"
+              << "    switch (entry_id) {\n";
+-        for (const auto label : function.entry_labels) {
+-            body << "    case " << id_by_label[label] << "u: goto L_"
+-                 << psprecomp::hex32(label).substr(2) << ";\n";
++        for (const auto label : id_labels) {
++            const std::string target = emit_case_target(label);
++            if (target.empty()) continue;
++            body << "    case " << id_by_label[label] << "u: " << target << "\n";
+         }
+         body << "    default:\n"
+              << "        if (local_transfers == 0u) rt.unsupported(ctx.pc, 0u, \"invalid internal function entry\");\n"
+@@ -969,15 +1219,19 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+              << "    }\n"
+              << "    }\n";
+     } else {
+-        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem) {\n"
++        body << "void " << cpp_name << "_entry(Runtime &rt, AllegrexContext &ctx, std::uint16_t direct_entry_id, GuestMemory::AotFastView &aot_mem_ref) {\n"
++                "    // A local copy of the view: its address never escapes, so stores through\n"
++                "    // the window cannot alias it and its pointers stay in registers.\n"
++                "    GuestMemory::AotFastView aot_mem = aot_mem_ref;\n"
+              << "    (void)direct_entry_id;\n"
+              << "    std::uint32_t jump_target = 0u;\n"
+              << "    std::uint32_t local_transfers = 0u;\n"
+              << "LOCAL_DISPATCH:\n"
+              << "    switch (ctx.pc) {\n";
+-        for (const auto label : function.entry_labels) {
+-            body << "    case " << psprecomp::hex32(label) << "u: goto L_"
+-                 << psprecomp::hex32(label).substr(2) << ";\n";
++        for (const auto label : id_labels) {
++            const std::string target = emit_case_target(label);
++            if (target.empty()) continue;
++            body << "    case " << psprecomp::hex32(label) << "u: " << target << "\n";
+         }
+         body << "    default:\n"
+              << "        if (local_transfers == 0u) rt.unsupported(ctx.pc, 0u, \"invalid internal function entry\");\n"
+@@ -989,9 +1243,21 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+              << "    }\n";
+     }
+ 
++    // A leaf's entry block comes first: it is entered by falling into it.
++    std::vector<std::uint32_t> block_order;
++    block_order.reserve(function.entry_labels.size());
++    const bool single_function = function.leaf || function.call_function;
++    if (single_function && function.entry_labels.contains(function.address))
++        block_order.push_back(function.address);
+     for (const auto block_start : function.entry_labels) {
++        if (single_function && block_start == function.address) continue;
++        block_order.push_back(block_start);
++    }
++    for (const auto block_start : block_order) {
+         body << "L_" << psprecomp::hex32(block_start).substr(2) << ":\n";
+         std::uint32_t pc = block_start;
++        PrefixState prefix;
++        prefix.enabled = function.fold_vfpu_prefixes;
+         while (function.instructions.contains(pc)) {
+             if (pc != block_start && function.entry_labels.contains(pc)) {
+                 body << "    goto L_" << psprecomp::hex32(pc).substr(2) << ";\n";
+@@ -1069,13 +1335,13 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                     }
+                     if (likely_branch) {
+                         body << "    if (" << condition << ") {\n"
+-                             << emit_regular(slot, pc + 4u);
++                             << emit_regular(slot, pc + 4u, prefix);
+                         emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                         body << "    }\n";
+                         emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                     } else {
+                         body << "    { const bool branch_taken = " << condition << ";\n"
+-                             << emit_regular(slot, pc + 4u)
++                             << emit_regular(slot, pc + 4u, prefix)
+                              << "      if (branch_taken) {\n";
+                         emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                         body << "      }\n";
+@@ -1088,7 +1354,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                     if (decoded.kind == psprecomp::OpcodeKind::Jal) {
+                         body << "    ctx.set_gpr(31, " << psprecomp::hex32(pc + 8u) << "u);\n";
+                     }
+-                    body << emit_regular(slot, pc + 4u);
++                    body << emit_regular(slot, pc + 4u, prefix);
+                     if (decoded.kind == psprecomp::OpcodeKind::J) {
+                         emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
+                     } else if (target == 0x08B648B0u) {
+@@ -1110,6 +1376,37 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         } else {
+                             body << "    return;\n";
+                         }
++                    } else if (function.leaf_entries != nullptr && function.leaf_entries->contains(target) &&
++                               function.unit_span_bytes != 0u && target >= function.executable_base) {
++                        // JAL to a leaf function: one direct call, the same
++                        // shape as the cross-unit chain below (the callee
++                        // stores ctx.pc at its `jr $ra`), also when the leaf
++                        // came out of this very unit.
++                        const std::uint32_t return_pc = pc + 8u;
++                        const std::uint32_t target_unit = (target - function.executable_base) / function.unit_span_bytes;
++                        const std::string call = leaf_chain_expression(target_unit, target, function.direct_entry_ids);
++                        if (function.entry_labels.contains(return_pc)) {
++                            body << "    if (" << call << " && ctx.pc == " << psprecomp::hex32(return_pc)
++                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
++                        } else {
++                            body << "    (void)" << call << ";\n";
++                        }
++                        body << "    return;\n";
++                    } else if (function.call_entries != nullptr && function.call_entries->contains(target) &&
++                               function.unit_span_bytes != 0u && target >= function.executable_base) {
++                        // JAL to a call function: the same direct call, at
++                        // entry id 0 (also a recursive call to the function
++                        // being emitted).
++                        const std::uint32_t return_pc = pc + 8u;
++                        const std::uint32_t target_unit = (target - function.executable_base) / function.unit_span_bytes;
++                        const std::string call = call_function_chain_expression(target_unit, target);
++                        if (function.entry_labels.contains(return_pc)) {
++                            body << "    if (" << call << " && ctx.pc == " << psprecomp::hex32(return_pc)
++                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
++                        } else {
++                            body << "    (void)" << call << ";\n";
++                        }
++                        body << "    return;\n";
+                     } else if (function.entry_labels.contains(target)) {
+                         // Fixed same-unit JAL: the destination is already a C++
+                         // label. Going through ctx.pc + LOCAL_DISPATCH needlessly
+@@ -1138,12 +1435,13 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         if (target_is_import) {
+                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
+                                  << "    return;\n";
+-                            continue;
++                            break;  // the block ends at this return (a continue here never advanced pc)
+                         }
+                         // Otherwise run the callee inline and resume locally only
+                         // if it came back to our return address.
+                         const bool direct_unit = function.unit_span_bytes != 0u &&
+-                            target >= function.executable_base;
++                            target >= function.executable_base &&
++                            unit_exists((target - function.executable_base) / function.unit_span_bytes);
+                         const std::uint32_t target_unit = direct_unit
+                             ? (target - function.executable_base) / function.unit_span_bytes : 0u;
+                         if (!direct_unit)
+@@ -1153,14 +1451,14 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                             if (direct_unit)
+                                 body << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids);
+                             else
+-                                body << "rt.invoke_chained_call(ctx, &aot_mem)";
++                                body << "rt.invoke_chained_call(ctx, &aot_mem_ref)";
+                             body << " && ctx.pc == " << psprecomp::hex32(return_pc)
+                                  << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
+                         } else {
+                             if (direct_unit)
+                                 body << "    (void)" << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids) << ";\n";
+                             else
+-                                body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
++                                body << "    (void)rt.invoke_chained_call(ctx, &aot_mem_ref);\n";
+                         }
+                         body << "    return;\n";
+                     }
+@@ -1170,7 +1468,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                     if (decoded.kind == psprecomp::OpcodeKind::Jalr) {
+                         body << "    ctx.set_gpr(" << link << ", " << psprecomp::hex32(pc + 8u) << "u);\n";
+                     }
+-                    body << emit_regular(slot, pc + 4u);
++                    body << emit_regular(slot, pc + 4u, prefix);
+                     if (decoded.kind == psprecomp::OpcodeKind::Jalr && pc == 0x0886269Cu) {
+                         const std::uint32_t return_pc = pc + 8u;
+                         body << "    ctx.pc = jump_target;\n"
+@@ -1190,13 +1488,20 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         const std::uint32_t return_pc = pc + 8u;
+                         body << "    ctx.pc = jump_target;\n";
+                         if (function.entry_labels.contains(return_pc)) {
+-                            body << "    if (rt.invoke_chained_call(ctx, &aot_mem) && ctx.pc == "
++                            body << "    if (rt.invoke_chained_call(ctx, &aot_mem_ref) && ctx.pc == "
+                                  << psprecomp::hex32(return_pc) << "u) goto L_"
+                                  << psprecomp::hex32(return_pc).substr(2) << ";\n";
+                         } else {
+-                            body << "    (void)rt.invoke_chained_call(ctx, &aot_mem);\n";
++                            body << "    (void)rt.invoke_chained_call(ctx, &aot_mem_ref);\n";
+                         }
+                         body << "    return;\n";
++                    } else if (function.leaf || function.call_function) {
++                        // `jr $ra` of a leaf or call function: the caller (a
++                        // direct call, a unit's forwarding entry or the
++                        // dispatcher) reads ctx.pc, exactly as after a unit's
++                        // return.  (Selection admits no other `jr` there.)
++                        body << "    ctx.pc = jump_target;\n"
++                             << "    return;\n";
+                     } else {
+                         // Plain JR, including `jr $ra`.  A return that lands in
+                         // this unit continues locally; otherwise the chained
+@@ -1219,7 +1524,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                 break;
+             }
+ 
+-            body << emit_regular(decoded, pc);
++            body << emit_regular(decoded, pc, prefix);
+             const std::uint32_t next = pc + 4u;
+             if (!function.instructions.contains(next)) {
+                 body << "    ctx.pc = " << psprecomp::hex32(next) << "u; return;\n";
+@@ -1233,6 +1538,23 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+         }
+     }
+     body << "}\n\n";
++    if (function.leaf) {
++        // The per-PC dispatcher entry of the leaf (outer loop, exact-PC chain
++        // fallback of a poisoned unit, invoke_isolated_aot).
++        body << "static void " << cpp_name << "_dispatch(Runtime &rt, AllegrexContext &ctx) {\n"
++             << "    auto aot_mem = rt.memory().aot_fast_view();\n"
++             << "    " << cpp_name << "(rt, ctx, aot_mem);\n}\n\n";
++        return body.str();
++    }
++    if (function.call_function) {
++        // The per-PC dispatcher entry of the function's entry PC.  Its
++        // continuation PCs stay registered with the covering unit, which
++        // forwards them with their ids.
++        body << "static void " << cpp_name << "_dispatch(Runtime &rt, AllegrexContext &ctx) {\n"
++             << "    auto aot_mem = rt.memory().aot_fast_view();\n"
++             << "    " << cpp_name << "(rt, ctx, 0u, aot_mem);\n}\n\n";
++        return body.str();
++    }
+     body << "void " << cpp_name << "(Runtime &rt, AllegrexContext &ctx) {\n"
+          << "    auto aot_mem = rt.memory().aot_fast_view();\n"
+          << "    " << cpp_name << "_entry(rt, ctx, 0u, aot_mem);\n}\n\n";
+@@ -1528,10 +1850,234 @@ bool write_text_if_changed(const std::filesystem::path &path, const std::string
+     return true;
+ }
+ 
++// --leaf-functions / --call-functions: a guest function is a region when it
++// can be emitted as one host function entered only at its entry (and, for a
++// call function, at the continuation after each of its calls) and left only
++// by `jr $ra`, a call's unwind or an import's handoff: its instructions belong
++// to no other analysed function, it writes $ra only through lw (a frame
++// restore) or its own jal/jalr, has no syscall and no computed jr, no
++// j/branch leaves it and none (and no jal) enters it from outside except a
++// jal to its entry, it does not straddle a unit boundary, and it contains no
++// import stub and no excluded (hand-hooked) PC.  A leaf makes no call of any
++// kind; a call function (allow_calls) makes jal/jalr calls, none to a label
++// of its own body except its entry, every continuation (call PC + 8) is one
++// of its own blocks and a unit entry, and it has no link branch (bal & co.,
++// whose returns would land on non-continuation labels).  Only jal targets
++// are converted: a region nobody calls directly gains nothing.  Everything
++// doubtful is excluded.
++struct FunctionRegion {
++    std::uint32_t entry{};
++    std::uint32_t unit{};
++    std::set<std::uint32_t> instructions;   // the function's labels
++    std::set<std::uint32_t> entry_labels;   // its blocks, as the unit had them
++    bool calls{};                           // a call function, not a leaf
++    std::vector<std::uint32_t> continuations;  // call PC + 8, ascending
++};
++
++struct RegionSelection {
++    std::vector<FunctionRegion> regions;
++    std::map<std::string, std::size_t> excluded;  // reason -> count
++    std::size_t candidates{};
++    std::size_t jal_sites{};                       // jal sites that now call a leaf
++    std::size_t call_jal_sites{};                  // jal sites that now call a call function
++};
++
++bool writes_ra_oddly(const psprecomp::DecodedInstruction &d) {
++    using K = psprecomp::OpcodeKind;
++    switch (d.kind) {
++    case K::Lw: case K::Jal: case K::Jalr: case K::Bltzal: case K::Bgezal: case K::Bltzall: case K::Bgezall:
++        return false;
++    case K::Addiu: case K::Lui: case K::Ori: case K::Andi: case K::Xori: case K::Slti: case K::Sltiu:
++    case K::Lh: case K::Lhu: case K::Lb: case K::Lbu: case K::Lwl: case K::Lwr: case K::Mfc1: case K::Mfv:
++    case K::Cfc1: case K::Ext: case K::Ins:
++        return d.rt == 31u;
++    case K::Add: case K::Addu: case K::Sub: case K::Subu: case K::Or: case K::And: case K::Xor: case K::Nor:
++    case K::Sll: case K::Srl: case K::Sra: case K::Rotr: case K::Sllv: case K::Srlv: case K::Srav: case K::Rotrv:
++    case K::Slt: case K::Sltu: case K::Movz: case K::Movn: case K::Mfhi: case K::Mflo: case K::Max: case K::Min:
++    case K::Seb: case K::Seh: case K::Clz: case K::Clo: case K::Bitrev: case K::Wsbh: case K::Wsbw:
++        return d.rd == 31u;
++    default:
++        return false;
++    }
++}
++
++RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &program,
++                                        const psprecomp::GuestMemory &memory,
++                                        const std::set<std::uint32_t> &import_stubs,
++                                        const std::set<std::uint32_t> &excluded_pcs,
++                                        const std::set<std::uint32_t> &global_entries,
++                                        const std::set<std::uint32_t> &valid_units,
++                                        std::uint32_t executable_base,
++                                        std::uint32_t unit_span_bytes,
++                                        bool allow_calls) {
++    using K = psprecomp::OpcodeKind;
++    RegionSelection selection;
++    const auto &ranges = program.executable_ranges;
++    const auto jump_target = [](std::uint32_t pc, const psprecomp::DecodedInstruction &d) {
++        return ((pc + 4u) & 0xF0000000u) | (d.target << 2u);
++    };
++    const auto branch_target = [](std::uint32_t pc, const psprecomp::DecodedInstruction &d) {
++        return pc + 4u + static_cast<std::uint32_t>(static_cast<std::int32_t>(d.immediate) * 4);
++    };
++
++    // Instructions owned by more than one analysed function, direct call
++    // counts per target, and every j/branch edge in the program by target.
++    std::unordered_map<std::uint32_t, std::uint32_t> owner_count;
++    owner_count.reserve(program.covered_labels.size() * 2u);
++    for (const auto &function : program.functions)
++        for (const auto label : function.labels) ++owner_count[label];
++    std::unordered_map<std::uint32_t, std::size_t> jal_sites_by_target;
++    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> jump_sources_by_target;
++    for (const auto pc : program.covered_labels) {
++        const auto d = psprecomp::decode_allegrex(memory.load32(pc));
++        if (d.kind == K::Jal) ++jal_sites_by_target[jump_target(pc, d)];
++        else if (d.kind == K::J) jump_sources_by_target[jump_target(pc, d)].push_back(pc);
++        else if (is_branch(d.kind)) jump_sources_by_target[branch_target(pc, d)].push_back(pc);
++    }
++
++    for (const auto &function : program.functions) {
++        if (function.labels.empty()) continue;
++        ++selection.candidates;
++        const auto exclude = [&](const char *reason) { ++selection.excluded[reason]; };
++        if (function.truncated) { exclude("truncated"); continue; }
++        if (jal_sites_by_target[function.entry] == 0u) { exclude("not a jal target"); continue; }
++        if (!global_entries.contains(function.entry)) { exclude("entry not a unit entry"); continue; }
++        bool shared = false;
++        for (const auto label : function.labels) if (owner_count[label] > 1u) { shared = true; break; }
++        if (shared) { exclude("shares instructions with another function"); continue; }
++        const std::uint32_t first = *function.labels.begin();
++        const std::uint32_t last = *function.labels.rbegin();
++        const std::uint32_t unit = (function.entry - executable_base) / unit_span_bytes;
++        if (first < executable_base || (first - executable_base) / unit_span_bytes != unit ||
++            (last + 4u - executable_base) / unit_span_bytes != unit) { exclude("straddles a unit boundary"); continue; }
++        if (!valid_units.contains(unit)) { exclude("unit not emitted"); continue; }
++        bool has_import = false, has_excluded = false;
++        for (const auto label : function.labels) {
++            if (import_stubs.contains(label) || import_stubs.contains(label + 4u)) has_import = true;
++            if (excluded_pcs.contains(label) || excluded_pcs.contains(label + 4u)) has_excluded = true;
++        }
++        if (has_import) { exclude("contains an import stub"); continue; }
++        if (has_excluded) { exclude("contains a hooked PC"); continue; }
++
++        const char *reason = nullptr;
++        std::vector<std::uint32_t> continuations;
++        for (const auto pc : function.labels) {
++            const auto d = psprecomp::decode_allegrex(memory.load32(pc));
++            psprecomp::DecodedInstruction slot{};
++            const bool delay = d.has_delay_slot();
++            if (delay) slot = psprecomp::decode_allegrex(memory.load32(pc + 4u));
++            if (d.kind == K::Jal || d.kind == K::Jalr || is_link_branch(d.kind)) {
++                if (!allow_calls) { reason = "makes a call"; break; }
++                if (is_link_branch(d.kind)) { reason = "link branch"; break; }
++                if (d.kind == K::Jal) {
++                    const std::uint32_t target = jump_target(pc, d);
++                    if (target != function.entry && function.labels.contains(target)) {
++                        reason = "jal into its own body"; break;
++                    }
++                }
++                // The continuation is where the dispatcher resumes this
++                // function after an unwind out of the call: it must be one of
++                // its blocks and keep a unit entry id to be forwarded with.
++                const std::uint32_t continuation = pc + 8u;
++                if (!function.labels.contains(continuation) || !global_entries.contains(continuation)) {
++                    reason = "continuation not a unit entry of the function"; break;
++                }
++                continuations.push_back(continuation);
++            }
++            if (d.kind == K::Syscall || (delay && slot.kind == K::Syscall)) { reason = "syscall"; break; }
++            if (d.kind == K::Unsupported || d.kind == K::Vfpu || (delay && (slot.kind == K::Unsupported || slot.kind == K::Vfpu))) {
++                reason = "unsupported instruction"; break;
++            }
++            if (delay && slot.is_control_flow()) { reason = "control flow in delay slot"; break; }
++            if (d.kind == K::Jr && d.rs != 31u) { reason = "computed jr"; break; }
++            if (writes_ra_oddly(d) || (delay && writes_ra_oddly(slot))) { reason = "writes $ra"; break; }
++            if (d.kind == K::J) {
++                if (!function.labels.contains(jump_target(pc, d))) { reason = "j leaves the function"; break; }
++            } else if (is_branch(d.kind)) {
++                const std::uint32_t taken = branch_target(pc, d);
++                const std::uint32_t fallthrough = pc + 8u;
++                if ((psprecomp::is_executable_address(ranges, taken) && !function.labels.contains(taken)) ||
++                    (psprecomp::is_executable_address(ranges, fallthrough) && !function.labels.contains(fallthrough))) {
++                    reason = "branch leaves the function"; break;
++                }
++            } else if (!delay && !d.is_control_flow()) {
++                // Linear flow must stay inside the function (a seed right after
++                // a non-returning path would otherwise be fallen into).
++                const std::uint32_t next = pc + 4u;
++                if (psprecomp::is_executable_address(ranges, next) && !function.labels.contains(next)) {
++                    reason = "falls out of the function"; break;
++                }
++            }
++            if (!delay && d.is_control_flow()) { reason = "unexpected control flow"; break; }
++        }
++        if (reason != nullptr) { exclude(reason); continue; }
++        bool entered_from_outside = false;
++        for (const auto label : function.labels) {
++            const auto sources = jump_sources_by_target.find(label);
++            if (sources == jump_sources_by_target.end()) continue;
++            for (const auto source : sources->second)
++                if (!function.labels.contains(source)) { entered_from_outside = true; break; }
++            if (entered_from_outside) break;
++        }
++        if (entered_from_outside) { exclude("j/branch target from outside"); continue; }
++        if (allow_calls) {
++            // A jal anywhere to a label of the body other than the entry.
++            bool jal_into_body = false;
++            for (const auto label : function.labels)
++                if (label != function.entry && jal_sites_by_target.contains(label) &&
++                    jal_sites_by_target.at(label) != 0u) { jal_into_body = true; break; }
++            if (jal_into_body) { exclude("jal target inside the body"); continue; }
++        }
++
++        FunctionRegion region;
++        region.entry = function.entry;
++        region.unit = unit;
++        region.instructions = function.labels;
++        for (const auto label : function.labels)
++            if (global_entries.contains(label)) region.entry_labels.insert(label);
++        // VCS: the dispatcher also re-enters functions at inner blocks it has
++        // registered (upstream registers every block entry), e.g. after a
++        // thread switch in an HLE. Each one becomes a continuation, so the
++        // function's entry switch resumes there; only functions with no inner
++        // entry stay leaves.
++        if (allow_calls) {
++            for (const auto label : region.entry_labels)
++                if (label != function.entry) continuations.push_back(label);
++            std::sort(continuations.begin(), continuations.end());
++            continuations.erase(std::unique(continuations.begin(), continuations.end()), continuations.end());
++        } else if (region.entry_labels.size() > 1u) {
++            exclude("inner entries");
++            continue;
++        }
++        region.calls = !continuations.empty();
++        region.continuations = std::move(continuations);
++        (region.calls ? selection.call_jal_sites : selection.jal_sites) += jal_sites_by_target[function.entry];
++        selection.regions.push_back(std::move(region));
++    }
++    return selection;
++}
++
++std::set<std::uint32_t> load_pc_list(const std::filesystem::path &path) {
++    std::ifstream in(path);
++    if (!in) throw psprecomp::Error("Cannot open PC list: " + path.string());
++    std::set<std::uint32_t> pcs;
++    std::string line;
++    while (std::getline(in, line)) {
++        const auto end = line.find_first_of(" \t#\r");
++        if (end != std::string::npos) line.erase(end);
++        if (line.empty()) continue;
++        pcs.insert(parse_hex(line));
++    }
++    return pcs;
++}
++
+ int generate_auto(const std::filesystem::path &elf_path,
+                   const std::filesystem::path &output_dir,
+                   std::uint32_t load_base,
+-                  std::uint32_t unit_span_bytes) {
++                  std::uint32_t unit_span_bytes,
++                  bool leaf_functions,
++                  bool call_functions,
++                  const std::set<std::uint32_t> &leaf_excluded_pcs) {
+     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
+     psprecomp::GuestMemory memory;
+     (void)elf.load_and_relocate(memory, load_base);
+@@ -1561,6 +2107,12 @@ int generate_auto(const std::filesystem::path &elf_path,
+         std::uint32_t bucket{};
+         std::set<std::uint32_t> instructions;
+         std::set<std::uint32_t> entries;
++        // --leaf-functions / --call-functions: the entries still emitted as
++        // blocks of the unit (entries minus the regions' blocks) and the
++        // regions that moved into their own functions, emitted in this
++        // unit's file.
++        std::set<std::uint32_t> code_entries;
++        std::vector<const FunctionRegion *> regions;
+     };
+     std::map<std::uint32_t, Unit> units_by_bucket;
+     for (const auto pc : program.covered_labels) {
+@@ -1585,12 +2137,69 @@ int generate_auto(const std::filesystem::path &elf_path,
+     // Stage 45.6: assign the same compact entry ids used by each unit's dense
+     // dispatcher globally before emission. Fixed cross-unit edges can pass the
+     // destination id directly and skip the target unit's PC->entry table lookup.
++    bool fold_vfpu_prefixes = true;
++    for (const auto &unit : units) {
++        std::uint32_t offending_pc = 0u;
++        if (!prefixes_fold_safely(memory, unit.instructions, unit.entries, offending_pc)) {
++            std::cout << "VFPU prefix at " << psprecomp::hex32(offending_pc)
++                      << " is not consumed in its block: prefixes stay run-time\n";
++            fold_vfpu_prefixes = false;
++            break;
++        }
++    }
++
+     std::map<std::uint32_t, std::uint16_t> direct_entry_ids;
+     for (const auto &unit : units) {
+         std::uint16_t id = 1u;
+         for (const auto label : unit.entries) direct_entry_ids[label] = id++;
+     }
+ 
++    // --leaf-functions / --call-functions: pick the regions, take their
++    // blocks out of their units (the ids above were assigned first and stay
++    // as they are; a region's entry, and a call function's continuations,
++    // keep their ids as forwarding cases) and remember every region entry
++    // for the jal sites.
++    std::set<std::uint32_t> valid_unit_buckets;
++    for (const auto &unit : units) valid_unit_buckets.insert(unit.bucket);
++    g_valid_units = &valid_unit_buckets;
++    RegionSelection region_selection;
++    std::map<std::uint32_t, std::string> leaf_entries;
++    std::map<std::uint32_t, std::string> call_entries;
++    std::map<std::uint32_t, std::string> call_forwards;
++    std::set<std::uint32_t> call_continuations;
++    std::size_t leaf_instructions = 0u;
++    std::size_t call_instructions = 0u;
++    std::size_t leaves_dropped = 0u;
++    for (auto &unit : units) unit.code_entries = unit.entries;
++    if (leaf_functions || call_functions) {
++        region_selection = select_function_regions(program, memory, import_stubs, leaf_excluded_pcs, global_entries,
++                                                   valid_unit_buckets, executable_base, unit_span_bytes,
++                                                   call_functions);
++        std::map<std::uint32_t, Unit *> unit_by_bucket;
++        for (auto &unit : units) unit_by_bucket[unit.bucket] = &unit;
++        for (const auto &region : region_selection.regions) {
++            if (!region.calls && !leaf_functions) { ++leaves_dropped; continue; }
++            Unit &unit = *unit_by_bucket.at(region.unit);
++            for (const auto pc : region.instructions) unit.instructions.erase(pc);
++            for (const auto label : region.entry_labels) unit.code_entries.erase(label);
++            unit.regions.push_back(&region);
++            if (!region.calls) {
++                leaf_entries[region.entry] = leaf_cpp_name(region.entry);
++                leaf_instructions += region.instructions.size();
++                continue;
++            }
++            const std::string name = call_function_cpp_name(region.entry);
++            call_entries[region.entry] = name;
++            call_forwards[region.entry] = name + "(rt, ctx, 0u, aot_mem_ref); return;";
++            std::uint32_t id = 1u;
++            for (const auto continuation : region.continuations) {
++                call_forwards[continuation] = name + "(rt, ctx, " + std::to_string(id++) + "u, aot_mem_ref); return;";
++                call_continuations.insert(continuation);
++            }
++            call_instructions += region.instructions.size();
++        }
++    }
++
+     // External declarations let fixed cross-unit edges become native direct
+     // calls. Under MSVC /GL + /LTCG the linker can optimize across these TUs
+     // instead of forcing every known edge through a function-pointer branch.
+@@ -1603,12 +2212,21 @@ int generate_auto(const std::filesystem::path &elf_path,
+         units_header << "void " << generated_unit_cpp_entry_name(unit.bucket)
+                      << "(Runtime &, AllegrexContext &, std::uint16_t, GuestMemory::AotFastView &);\n";
+     }
++    for (const auto &[entry, name] : leaf_entries) {
++        units_header << "void " << name << "(Runtime &, AllegrexContext &, GuestMemory::AotFastView &);\n";
++    }
++    for (const auto &[entry, name] : call_entries) {
++        units_header << "void " << name << "(Runtime &, AllegrexContext &, std::uint16_t, GuestMemory::AotFastView &);\n";
++    }
+     units_header << "} // namespace psprecomp\n";
+     (void)write_text_if_changed(units_header_path, units_header.str());
+ 
+     std::set<std::filesystem::path> expected_cpp;
+     std::size_t rewritten_units = 0u;
+     std::size_t registered_entries = 0u;
++    std::size_t registered_leaves = 0u;
++    std::size_t registered_calls = 0u;
++    std::size_t registered_continuations = 0u;
+     for (const auto &unit : units) {
+         std::ostringstream suffix;
+         suffix << std::setfill('0') << std::setw(4) << unit.bucket;
+@@ -1620,11 +2238,17 @@ int generate_auto(const std::filesystem::path &elf_path,
+             "recomp_unit_" + suffix_text,
+             executable_base + unit.bucket * unit_span_bytes,
+             unit.instructions,
+-            unit.entries,
++            unit.code_entries,
+             executable_base,
+             unit_span_bytes,
+             &direct_entry_ids,
+             &import_stubs,
++            fold_vfpu_prefixes,
++            &unit.entries,
++            leaf_functions ? &leaf_entries : nullptr,
++            false,
++            call_functions ? &call_entries : nullptr,
++            call_functions ? &call_forwards : nullptr,
+         };
+ 
+         std::ostringstream out;
+@@ -1644,8 +2268,32 @@ int generate_auto(const std::filesystem::path &elf_path,
+                 std::cerr << "[codegen] unit " << suffix_text << " " << name << " " << ms << " ms\n" << std::flush;
+                 return result;
+             };
++            // The unit's leaf functions first, then the unit itself.
+             std::string text = stage("emit", [&](std::string) {
+-                return emit_function_source(generated_unit, memory, generated_unit.name);
++                std::string source;
++                for (const FunctionRegion *region : unit.regions) {
++                    const GeneratedFunctionInput single{
++                        region->calls ? call_function_cpp_name(region->entry) : leaf_cpp_name(region->entry),
++                        region->entry,
++                        region->instructions,
++                        region->entry_labels,
++                        executable_base,
++                        unit_span_bytes,
++                        &direct_entry_ids,
++                        &import_stubs,
++                        fold_vfpu_prefixes,
++                        nullptr,
++                        &leaf_entries,
++                        !region->calls,
++                        region->calls ? &call_entries : nullptr,
++                        nullptr,
++                        region->calls,
++                        region->calls ? &region->continuations : nullptr,
++                    };
++                    source += emit_function_source(single, memory, single.name);
++                }
++                source += emit_function_source(generated_unit, memory, generated_unit.name);
++                return source;
+             }, std::string{});
+             text = stage("gpr_writes", lower_constant_gpr_writes, std::move(text));
+             text = stage("fpr_accesses", lower_constant_fpr_accesses, std::move(text));
+@@ -1659,9 +2307,31 @@ int generate_auto(const std::filesystem::path &elf_path,
+             << "u, &" << generated_unit.name << ", &"
+             << generated_unit_cpp_entry_name(unit.bucket) << ");\n";
+         for (const auto label : unit.entries) {
++            // A leaf entry is registered with the leaf's own dispatcher entry
++            // (the "recomp_leaf_" name keeps it chainable); a leaf's inner
++            // block is no entry any more and is registered nowhere.
++            const auto leaf = leaf_entries.find(label);
++            if (leaf != leaf_entries.end()) {
++                out << "    runtime.register_function(" << psprecomp::hex32(label) << "u, &"
++                    << leaf->second << "_dispatch, \"" << leaf->second << "\");\n";
++                ++registered_leaves;
++                continue;
++            }
++            // A call function's entry likewise; its continuations stay
++            // registered with the unit, whose entry switch forwards them.
++            const auto call = call_entries.find(label);
++            if (call != call_entries.end()) {
++                out << "    runtime.register_function(" << psprecomp::hex32(label) << "u, &"
++                    << call->second << "_dispatch, \"" << call->second << "\");\n";
++                ++registered_calls;
++                continue;
++            }
++            const bool continuation = call_continuations.contains(label);
++            if (!unit.code_entries.contains(label) && !continuation) continue;
+             out << "    runtime.register_function(" << psprecomp::hex32(label) << "u, &"
+                 << generated_unit.name << ", \"" << generated_unit.name << "\");\n";
+             ++registered_entries;
++            if (continuation) ++registered_continuations;
+         }
+         out << "}\n} // namespace psprecomp\n";
+         rewritten_units += write_text_if_changed(path, out.str()) ? 1u : 0u;
+@@ -1702,8 +2372,34 @@ int generate_auto(const std::filesystem::path &elf_path,
+            << "  \"rewritten_translation_units\": " << rewritten_units << ",\n"
+            << "  \"registry_rewritten\": " << (registry_rewritten ? "true" : "false") << ",\n"
+            << "  \"import_wrappers\": " << imports.size() << ",\n"
+-           << "  \"unit_span_bytes\": " << unit_span_bytes << "\n"
+-           << "}\n";
++           << "  \"vfpu_prefixes_folded\": " << (fold_vfpu_prefixes ? "true" : "false") << ",\n"
++           << "  \"unit_span_bytes\": " << unit_span_bytes;
++    if (leaf_functions) {
++        report << ",\n  \"leaf_functions\": " << leaf_entries.size() << ",\n"
++               << "  \"leaf_instructions\": " << leaf_instructions << ",\n"
++               << "  \"leaf_jal_sites\": " << region_selection.jal_sites << ",\n"
++               << "  \"leaf_candidates\": " << region_selection.candidates;
++    }
++    if (call_functions) {
++        std::size_t continuations = 0u;
++        for (const auto &region : region_selection.regions) continuations += region.continuations.size();
++        report << ",\n  \"call_functions\": " << call_entries.size() << ",\n"
++               << "  \"call_function_instructions\": " << call_instructions << ",\n"
++               << "  \"call_function_jal_sites\": " << region_selection.call_jal_sites << ",\n"
++               << "  \"call_function_continuations\": " << continuations << ",\n"
++               << "  \"call_function_candidates\": " << region_selection.candidates;
++    }
++    if (leaf_functions || call_functions) {
++        report << ",\n  \"" << (call_functions ? "function_excluded" : "leaf_excluded") << "\": {";
++        if (leaves_dropped != 0u) report << "\n    \"leaf (--leaf-functions off)\": " << leaves_dropped << ",";
++        bool first = true;
++        for (const auto &[reason, count] : region_selection.excluded) {
++            report << (first ? "\n" : ",\n") << "    \"" << reason << "\": " << count;
++            first = false;
++        }
++        report << "\n  }";
++    }
++    report << "\n}\n";
+     write_text_if_changed(output_dir / "auto_codegen_report.json", report.str());
+ 
+     std::cout << "Automatic global codegen completed\n"
+@@ -1714,6 +2410,24 @@ int generate_auto(const std::filesystem::path &elf_path,
+               << "  rewritten units:   " << rewritten_units << "\n"
+               << "  import wrappers:   " << imports.size() << "\n"
+               << "  output:            " << output_dir.string() << "\n";
++    if (leaf_functions) {
++        std::cout << "  leaf functions:    " << leaf_entries.size() << " (" << leaf_instructions
++                  << " instructions, " << region_selection.jal_sites << " jal sites, " << registered_leaves
++                  << " registered entries) of " << region_selection.candidates << " candidates\n";
++    }
++    if (call_functions) {
++        std::size_t continuations = 0u;
++        for (const auto &region : region_selection.regions) continuations += region.continuations.size();
++        std::cout << "  call functions:    " << call_entries.size() << " (" << call_instructions
++                  << " instructions, " << region_selection.call_jal_sites << " jal sites, " << continuations
++                  << " continuations, " << registered_calls << " registered entries, " << registered_continuations
++                  << " continuations registered with their unit) of " << region_selection.candidates << " candidates\n";
++        if (leaves_dropped != 0u) std::cout << "    leaves not emitted (--leaf-functions off): " << leaves_dropped << "\n";
++    }
++    if (leaf_functions || call_functions) {
++        for (const auto &[reason, count] : region_selection.excluded)
++            std::cout << "    excluded, " << reason << ": " << count << "\n";
++    }
+     return 0;
+ }
+ 
+@@ -1721,24 +2435,48 @@ int generate_auto(const std::filesystem::path &elf_path,
+ 
+ int main(int argc, char **argv) {
+     try {
++        const char *auto_usage =
++            "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
++            " [--leaf-functions] [--call-functions] [--leaf-exclude <pc_list>]\n";
+         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
+-            if (argc > 6) {
+-                std::cerr << "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
++            std::vector<std::string_view> positional;
++            bool leaf_functions = false;
++            bool call_functions = false;
++            std::set<std::uint32_t> leaf_excluded_pcs;
++            for (int i = 4; i < argc; ++i) {
++                const std::string_view argument(argv[i]);
++                if (argument == "--leaf-functions") {
++                    leaf_functions = true;
++                } else if (argument == "--call-functions") {
++                    call_functions = true;
++                } else if (argument == "--leaf-exclude") {
++                    if (i + 1 >= argc) { std::cerr << auto_usage; return 2; }
++                    leaf_excluded_pcs = load_pc_list(argv[++i]);
++                } else if (argument.starts_with("--")) {
++                    std::cerr << auto_usage;
++                    return 2;
++                } else {
++                    positional.push_back(argument);
++                }
++            }
++            if (positional.size() > 2u) {
++                std::cerr << auto_usage;
+                 return 2;
+             }
+-            const std::uint32_t load_base = argc >= 5
+-                ? static_cast<std::uint32_t>(std::stoul(argv[4], nullptr, 0))
++            const std::uint32_t load_base = positional.size() >= 1u
++                ? static_cast<std::uint32_t>(std::stoul(std::string(positional[0]), nullptr, 0))
+                 : psprecomp::kDefaultPspUserLoadBase;
+-            const std::uint32_t unit_span = argc >= 6
+-                ? static_cast<std::uint32_t>(std::stoul(argv[5], nullptr, 0))
++            const std::uint32_t unit_span = positional.size() >= 2u
++                ? static_cast<std::uint32_t>(std::stoul(std::string(positional[1]), nullptr, 0))
+                 : 0x20000u;
+             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
+-            return generate_auto(argv[1], argv[3], load_base, unit_span);
++            return generate_auto(argv[1], argv[3], load_base, unit_span, leaf_functions, call_functions,
++                                 leaf_excluded_pcs);
+         }
+         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
+         std::cerr << "Usage:\n"
+                   << "  psp_recomp <ELF> <functions.csv> <generated_manifest.cpp>\n"
+-                  << "  psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]\n";
++                  << "  " << auto_usage;
+         return 2;
+     } catch (const std::exception &e) {
+         std::cerr << "psp_recomp error: " << e.what() << "\n";

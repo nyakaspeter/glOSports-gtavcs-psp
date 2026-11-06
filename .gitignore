@@ -1,0 +1,19 @@
+upstream/
+game/
+build/
+build-host/
+build-*/
+out/
+*.out/
+*.pgo/
+
+# Release zips and description, uploaded as GitHub releases (the -full zips hold game files)
+release/
+
+# Not published: game files and anything extracted or converted from them,
+# build output, caches from a device, upstream checkouts, release zips
+/out-*/
+/gamedata/
+__pycache__/
+.DS_Store
+/config/shader-cache/

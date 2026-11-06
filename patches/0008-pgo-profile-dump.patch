@@ -1,0 +1,36 @@
+diff --git a/profiles/vcs/host/main.cpp b/profiles/vcs/host/main.cpp
+index d37d23c..69de18a 100644
+--- a/profiles/vcs/host/main.cpp
++++ b/profiles/vcs/host/main.cpp
+@@ -16,6 +16,10 @@
+ #include <array>
+ #include <atomic>
+ #include <cerrno>
++#include <csignal>
++#if !defined(_WIN32)
++#include <unistd.h>
++#endif
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstdio>
+@@ -214,7 +218,20 @@ void validate_vcs_game_root(const std::filesystem::path &root) {
+ 
+ } // namespace
+ 
++#if defined(VCS_PGO_GENERATE)
++// Instrumented builds (PGO=generate) only write their profile on a normal
++// exit, and the game has no quit: SIGUSR1 writes it and exits.
++extern "C" void __gcov_dump(void);
++static void dump_profile_and_exit(int) {
++    __gcov_dump();
++    _exit(0);
++}
++#endif
++
+ int main(int argc, char **argv) {
++#if defined(VCS_PGO_GENERATE)
++    std::signal(SIGUSR1, dump_profile_and_exit);
++#endif
+ #ifdef _WIN32
+     SetUnhandledExceptionFilter(&vcs_unhandled_exception_filter);
+ #endif

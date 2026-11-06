@@ -1,0 +1,297 @@
+diff --git a/profiles/vcs/host/audio_output.cpp b/profiles/vcs/host/audio_output.cpp
+index eb3b405..0691244 100644
+--- a/profiles/vcs/host/audio_output.cpp
++++ b/profiles/vcs/host/audio_output.cpp
+@@ -601,9 +601,9 @@ std::uint64_t audio_output_frames_played() {
+ 
+ } // namespace vcs
+ 
+-#elif defined(__APPLE__)
++#elif defined(__APPLE__) || defined(VCS_SDL_AUDIO)
+ 
+-// macOS audio backend using SDL2.
++// macOS audio backend using SDL2 (also the Linux handheld build's, VCS_SDL_AUDIO).
+ //
+ // This used to be a guest-time-anchored ring buffer: every channel's samples
+ // were written to an absolute sample position computed from the guest's
+diff --git a/profiles/vcs/platform/linux/display_window_sdl.cpp b/profiles/vcs/platform/linux/display_window_sdl.cpp
+new file mode 100644
+index 0000000..6dd9ec6
+--- /dev/null
++++ b/profiles/vcs/platform/linux/display_window_sdl.cpp
+@@ -0,0 +1,275 @@
++// Linux handheld input and presentation for the GLES 2 GE backend (ARM's
++// Mali-400 fbdev driver on the GA36-MB). There is no window: the backend
++// owns the screen through EGL on /dev/fb0, and frames the GE did not draw
++// (movies, screens the game writes to guest RAM) go to it as RGBA. SDL is
++// used for the game controller only.
++#include "display_window.hpp"
++#include "ge_gpu_backend.hpp"
++#include "vcs_camera_input.hpp"
++#include "vcs_config.hpp"
++#include "vcs_key_prompts.hpp"
++#include "vcs_vehicle_input.hpp"
++
++#include <SDL.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
++#include <cstring>
++#include <iostream>
++#include <mutex>
++#include <vector>
++
++namespace vcs {
++namespace {
++
++constexpr std::uint32_t kPspSelect   = 0x000001u;
++constexpr std::uint32_t kPspStart    = 0x000008u;
++constexpr std::uint32_t kPspUp       = 0x000010u;
++constexpr std::uint32_t kPspRight    = 0x000020u;
++constexpr std::uint32_t kPspDown     = 0x000040u;
++constexpr std::uint32_t kPspLeft     = 0x000080u;
++constexpr std::uint32_t kPspLTrigger = 0x000100u;
++constexpr std::uint32_t kPspRTrigger = 0x000200u;
++constexpr std::uint32_t kPspTriangle = 0x001000u;
++constexpr std::uint32_t kPspCircle   = 0x002000u;
++constexpr std::uint32_t kPspCross    = 0x004000u;
++constexpr std::uint32_t kPspSquare   = 0x008000u;
++
++struct InputState {
++    std::mutex mutex;
++    bool started{};
++    SDL_GameController *controller{};
++    std::chrono::steady_clock::time_point last_scan{};
++};
++
++InputState &input_state() {
++    static InputState state;
++    return state;
++}
++
++// A stick as a direction and a deflection: the dead zone is on the deflection
++// (radial), so a small push keeps its angle; a per-axis dead zone turns a
++// stick into eight directions. VCS_STICK_SCALE (default 1) multiplies the raw
++// deflection: the GA36-MB's sticks reach only about two thirds of what its
++// gamepad driver declares, so its start.sh sets 1.5. VCS_STICK_DEADZONE
++// (default 0.20) is the radial dead zone as a fraction of full deflection.
++float stick_setting(const char *name, float fallback) noexcept {
++    const char *text = std::getenv(name);
++    if (text == nullptr || *text == '\0') return fallback;
++    char *end = nullptr;
++    const float value = std::strtof(text, &end);
++    return end != text && value >= 0.0f && value < 10.0f ? value : fallback;
++}
++
++void stick_radial(Sint16 raw_x, Sint16 raw_y, int &out_x, int &out_y) noexcept {
++    static const float kScale = stick_setting("VCS_STICK_SCALE", 1.0f);
++    static const float kDeadZone = std::min(stick_setting("VCS_STICK_DEADZONE", 0.20f), 0.95f);
++    const float x = static_cast<float>(raw_x) / 32767.0f * kScale;
++    const float y = static_cast<float>(raw_y) / 32767.0f * kScale;
++    const float deflection = std::sqrt(x * x + y * y);
++    if (deflection <= kDeadZone) {
++        out_x = out_y = 0;
++        return;
++    }
++    const float scale = std::min(1.0f, (deflection - kDeadZone) / (1.0f - kDeadZone)) / deflection;
++    out_x = std::clamp(static_cast<int>(std::lround(x * scale * 127.0f)), -127, 127);
++    out_y = std::clamp(static_cast<int>(std::lround(y * scale * 127.0f)), -127, 127);
++}
++
++// Opens the first game controller; looked for again once a second while
++// there is none, so one plugged in later is picked up.
++SDL_GameController *controller(InputState &state) {
++    if (state.controller != nullptr && SDL_GameControllerGetAttached(state.controller))
++        return state.controller;
++    const auto now = std::chrono::steady_clock::now();
++    if (state.last_scan.time_since_epoch().count() != 0 && now - state.last_scan < std::chrono::seconds(1))
++        return nullptr;
++    state.last_scan = now;
++    if (state.controller != nullptr) {
++        SDL_GameControllerClose(state.controller);
++        state.controller = nullptr;
++    }
++    for (int index = 0; index < SDL_NumJoysticks(); ++index) {
++        if (!SDL_IsGameController(index)) continue;
++        state.controller = SDL_GameControllerOpen(index);
++        if (state.controller != nullptr) {
++            std::cerr << "[input] controller: " << SDL_GameControllerName(state.controller) << "\n";
++            break;
++        }
++    }
++    return state.controller;
++}
++
++} // namespace
++
++bool display_window_enabled() { return true; }
++
++void display_window_start() {
++    InputState &state = input_state();
++    std::lock_guard<std::mutex> guard(state.mutex);
++    if (state.started) return;
++    if (SDL_InitSubSystem(SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
++        std::cerr << "[input] SDL_Init failed: " << SDL_GetError() << "\n";
++        return;
++    }
++    state.started = true;
++    controller(state);
++}
++
++void display_window_set_status(const char *) {}
++
++void display_window_set_aspect_lock(bool) noexcept {}
++
++void display_window_present(const psprecomp::GuestMemory &memory, const FramebufferDescription &description) {
++    // Converted straight from guest memory a row at a time (the generic
++    // decoder went pixel by pixel through RGB, 8.5 ms a vblank), and only
++    // handed on when the picture changed: a 30 fps movie repeats every other
++    // vblank, and the screen keeps the last frame anyway.
++    const std::uint32_t width = description.width, height = description.height;
++    const std::uint32_t bpp = description.pixel_format == 3u ? 4u : 2u;
++    if (width == 0u || height == 0u || description.stride < width || description.pixel_format > 3u) return;
++    const std::uint8_t *source = memory.raw_pointer(
++        description.address, (static_cast<std::size_t>(height - 1u) * description.stride + width) * bpp);
++    if (source == nullptr) return;
++    static thread_local std::vector<std::byte> rgba, previous;
++    rgba.resize(static_cast<std::size_t>(width) * height * 4u);
++    auto *out = reinterpret_cast<std::uint8_t *>(rgba.data());
++    for (std::uint32_t y = 0u; y < height; ++y) {
++        const std::uint8_t *row = source + static_cast<std::size_t>(y) * description.stride * bpp;
++        std::uint8_t *to = out + static_cast<std::size_t>(y) * width * 4u;
++        if (bpp == 4u) {
++            std::memcpy(to, row, static_cast<std::size_t>(width) * 4u);
++            for (std::uint32_t x = 0u; x < width; ++x) to[x * 4u + 3u] = 0xFFu;
++            continue;
++        }
++        for (std::uint32_t x = 0u; x < width; ++x) {
++            const std::uint32_t pixel = static_cast<std::uint32_t>(row[x * 2u]) | (static_cast<std::uint32_t>(row[x * 2u + 1u]) << 8u);
++            std::uint32_t r, g, b;
++            if (description.pixel_format == 0u) {         // 5650
++                r = pixel & 0x1Fu; g = (pixel >> 5u) & 0x3Fu; b = (pixel >> 11u) & 0x1Fu;
++                r = (r << 3u) | (r >> 2u); g = (g << 2u) | (g >> 4u); b = (b << 3u) | (b >> 2u);
++            } else if (description.pixel_format == 1u) {  // 5551
++                r = pixel & 0x1Fu; g = (pixel >> 5u) & 0x1Fu; b = (pixel >> 10u) & 0x1Fu;
++                r = (r << 3u) | (r >> 2u); g = (g << 3u) | (g >> 2u); b = (b << 3u) | (b >> 2u);
++            } else {                                      // 4444
++                r = (pixel & 0xFu) * 17u; g = ((pixel >> 4u) & 0xFu) * 17u; b = ((pixel >> 8u) & 0xFu) * 17u;
++            }
++            to[x * 4u + 0u] = static_cast<std::uint8_t>(r);
++            to[x * 4u + 1u] = static_cast<std::uint8_t>(g);
++            to[x * 4u + 2u] = static_cast<std::uint8_t>(b);
++            to[x * 4u + 3u] = 0xFFu;
++        }
++    }
++    // A GPU frame shown since the last one here has to be replaced even when
++    // the guest picture is the same.
++    static thread_local std::uint64_t gpu_frames_seen = 0u;
++    const std::uint64_t gpu_frames = ge_gpu_backend_report().game_frames;
++    if (gpu_frames == gpu_frames_seen && rgba.size() == previous.size() &&
++        std::memcmp(rgba.data(), previous.data(), rgba.size()) == 0)
++        return;
++    gpu_frames_seen = gpu_frames;
++    previous = rgba;
++    (void)ge_gpu_backend_present_rgba(rgba, width, height, true);
++}
++
++void display_window_present_rgba(std::span<const std::byte> rgba, std::uint32_t width, std::uint32_t height) {
++    (void)ge_gpu_backend_present_rgba(rgba, width, height, true);
++}
++
++DisplayWindowSurface display_window_surface() { return {}; }
++
++HostInputState display_window_input() {
++    // The buttons and the stick are fetched by separate callers within one
++    // poll, so a reading is reused for a few milliseconds.
++    static std::mutex cache_mutex;
++    static HostInputState cached{};
++    static std::chrono::steady_clock::time_point cached_at{};
++    const std::lock_guard<std::mutex> cache_guard(cache_mutex);
++    const auto now = std::chrono::steady_clock::now();
++    if (cached_at.time_since_epoch().count() != 0 && now - cached_at < std::chrono::milliseconds(4))
++        return cached;
++    cached_at = now;
++    cached = HostInputState{};
++
++    InputState &state = input_state();
++    std::lock_guard<std::mutex> guard(state.mutex);
++    if (!state.started) return cached;
++    SDL_GameControllerUpdate();
++    SDL_GameController *pad = controller(state);
++    if (pad == nullptr) return cached;
++
++    HostInputState input{};
++    const auto pressed = [pad](SDL_GameControllerButton b) { return SDL_GameControllerGetButton(pad, b) != 0; };
++    const bool driving = vcs_player_in_vehicle();
++    if (pressed(SDL_CONTROLLER_BUTTON_A)) input.buttons |= kPspCross;
++    if (pressed(SDL_CONTROLLER_BUTTON_X)) input.buttons |= kPspSquare;
++    if (pressed(SDL_CONTROLLER_BUTTON_Y)) input.buttons |= kPspTriangle;
++    if (pressed(SDL_CONTROLLER_BUTTON_B)) input.buttons |= kPspCircle;
++    if (pressed(SDL_CONTROLLER_BUTTON_LEFTSHOULDER)) input.buttons |= kPspLTrigger;
++    if (pressed(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER)) input.buttons |= kPspRTrigger;
++    if (pressed(SDL_CONTROLLER_BUTTON_START)) input.buttons |= kPspStart;
++    if (pressed(SDL_CONTROLLER_BUTTON_BACK)) input.buttons |= kPspSelect;
++    if (pressed(SDL_CONTROLLER_BUTTON_DPAD_UP)) input.buttons |= kPspUp;
++    if (pressed(SDL_CONTROLLER_BUTTON_DPAD_DOWN)) input.buttons |= kPspDown;
++    if (pressed(SDL_CONTROLLER_BUTTON_DPAD_LEFT)) input.buttons |= kPspLeft;
++    if (pressed(SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) input.buttons |= kPspRight;
++
++    // The triggers: on foot they aim and look behind; in a vehicle they are
++    // the throttle and the brake (aiming would suppress the throttle).
++    constexpr Sint16 kTriggerThreshold = 8192;
++    const bool left_trigger = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > kTriggerThreshold;
++    const bool right_trigger = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > kTriggerThreshold;
++    if (!driving) {
++        if (left_trigger) input.buttons |= kPspLTrigger;
++        if (right_trigger) input.buttons |= kPspRTrigger;
++    }
++    input.accelerate = right_trigger;
++    input.brake = left_trigger;
++
++    int x = 0, y = 0;
++    stick_radial(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX),
++                 SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY), x, y);
++    // SDL and the PSP both have Y growing downward.
++    input.analog_x = static_cast<std::uint8_t>(128 + x);
++    input.analog_y = static_cast<std::uint8_t>(128 + y);
++    stick_radial(SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTX),
++                 SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_RIGHTY), x, y);
++    // The camera axis grows upward.
++    y = -y;
++    if (vcs_configuration().controls.invert_camera_y) y = -y;
++    input.camera_x = x;
++    input.camera_y = y;
++    if (input.buttons != 0u || x != 0 || y != 0) vcs_prompt_note_input(true);
++    cached = input;
++    return cached;
++}
++
++std::uint32_t display_window_buttons() { return display_window_input().buttons; }
++
++void display_window_analog(std::uint8_t &x, std::uint8_t &y) {
++    const HostInputState input = display_window_input();
++    x = input.analog_x;
++    y = input.analog_y;
++}
++
++// Start+Select makes the launcher send SIGTERM (appctl stop-application);
++// SDL's signal handler turns it into an SDL_QUIT event.
++bool display_window_close_requested() {
++    InputState &state = input_state();
++    std::lock_guard<std::mutex> guard(state.mutex);
++    return state.started && SDL_QuitRequested();
++}
++
++bool display_window_debug_dump_requested() { return false; }
++
++void display_window_shutdown() {
++    InputState &state = input_state();
++    std::lock_guard<std::mutex> guard(state.mutex);
++    if (state.controller != nullptr) SDL_GameControllerClose(state.controller);
++    state.controller = nullptr;
++}
++
++} // namespace vcs

@@ -1,0 +1,180 @@
+diff --git a/profiles/vcs/host/ge_gpu_backend_gles2.cpp b/profiles/vcs/host/ge_gpu_backend_gles2.cpp
+index 6874e03..6411647 100644
+--- a/profiles/vcs/host/ge_gpu_backend_gles2.cpp
++++ b/profiles/vcs/host/ge_gpu_backend_gles2.cpp
+@@ -412,6 +412,11 @@ struct RenderState {
+     // FPS counter: screen presents per second; drawn top left (Display.ShowFPS),
+     // logged with PSP and GL draws per frame (VCS_FPS_LOG).
+     double fps{};
++    // The counter on screen: frames over whole seconds, so the few ms the
++    // presentation lags the game's frames by do not read a capped 30 as 31.
++    double shown_fps{};
++    std::chrono::steady_clock::time_point shown_start{};
++    std::uint32_t shown_frames{};
+     bool log_fps{};
+     std::chrono::steady_clock::time_point fps_start{};
+     std::uint32_t fps_frames{};
+@@ -2054,11 +2059,105 @@ void draw_to_screen(RenderState &r, GLuint texture, float aspect) {
+     invalidate_state(r);
+ }
+ 
++// Display.ShowFPS under GLES 2 (from LCS 0046; the backend-independent
++// overlay in vcs_fps_overlay.cpp draws into the game's frame instead):
++// "28 fps" in the top-left corner, drawn as the goodluckOS Android ports do:
++// a 5x9 font at 2 pixels a dot, off-white over a dark copy 2 pixels down and
++// right, drawn with scissored clears (one per run of lit dots in a row), so
++// it needs no texture or shader.
++void draw_fps(RenderState &r) {
++    if (!vcs_configuration().display.show_fps || r.shown_fps <= 0.0) return;
++    // Glyphs 0-9, f, p, s; bit 4 is the left column, rows 7-8 for descenders.
++    static constexpr std::uint8_t kGlyphs[13][9] = {
++        {0x0e, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0e}, {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e},
++        {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f}, {0x1f, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0e},
++        {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02}, {0x1f, 0x10, 0x1e, 0x01, 0x01, 0x11, 0x0e},
++        {0x06, 0x08, 0x10, 0x1e, 0x11, 0x11, 0x0e}, {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
++        {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e}, {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x02, 0x0c},
++        {0x06, 0x09, 0x08, 0x1c, 0x08, 0x08, 0x08}, {0, 0, 0x1e, 0x11, 0x11, 0x11, 0x1e, 0x10, 0x10},
++        {0, 0, 0x0f, 0x10, 0x0e, 0x01, 0x1e},
++    };
++    constexpr int kDot = 2;
++    constexpr int kAdvance = 6 * kDot;
++    const int fps = std::min(999, static_cast<int>(r.shown_fps + 0.5));
++    int glyphs[6];
++    int count = 0;
++    if (fps >= 100) glyphs[count++] = fps / 100;
++    if (fps >= 10) glyphs[count++] = fps / 10 % 10;
++    glyphs[count++] = fps % 10;
++    const int digits = count;
++    glyphs[count++] = 10;
++    glyphs[count++] = 11;
++    glyphs[count++] = 12;
++    const int screen_height = static_cast<int>(r.screen_height);
++    const int top = 6;
++    const int x0 = 6;  // the top-left corner, where the counter has always been
++    glEnable(GL_SCISSOR_TEST);
++    for (int pass = 0; pass < 3; ++pass) {
++        const int offset = 2 - pass;  // two shadow passes, then the text
++        if (offset != 0) glClearColor(0.05f, 0.05f, 0.05f, 1.0f);
++        else glClearColor(0.94f, 0.94f, 0.9f, 1.0f);
++        for (int i = 0, x = x0; i < count; ++i, x += kAdvance) {
++            if (i == digits) x += kAdvance / 2;  // the space
++            for (int row = 0; row < 9; ++row) {
++                const unsigned bits = kGlyphs[glyphs[i]][row];
++                for (int column = 0; column < 5; ++column) {
++                    if ((bits & (0x10u >> column)) == 0u) continue;
++                    int run = 1;
++                    while (column + run < 5 && (bits & (0x10u >> (column + run))) != 0u) ++run;
++                    const int px = x + offset + column * kDot;
++                    const int py = top + offset + row * kDot;  // from the top; GL counts from the bottom
++                    glScissor(px, screen_height - py - kDot, run * kDot, kDot);
++                    glClear(GL_COLOR_BUFFER_BIT);
++                    column += run;
++                }
++            }
++        }
++    }
++    glDisable(GL_SCISSOR_TEST);
++}
++
++// VCS_FPS_CAP=<n> also paces the presents: a frame goes to the screen no
++// sooner than 1/n s after the one before, on a grid a late frame starts
++// again, as the goodluckOS Android ports' cap does (LCS 0049). The cap in the
++// vblank wait spaces the game's frames, but frames that queued in the GE and render
++// threads during a dip reached the screen in a burst afterwards (31-32 on the
++// counter).
++void pace_present() {
++    static const std::uint32_t fps = [] {
++        const char *text = std::getenv("VCS_FPS_CAP");
++        if (text == nullptr || *text == '\0') return 0u;
++        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
++    }();
++    if (fps == 0u) return;
++    static std::chrono::steady_clock::time_point deadline{};
++    const auto period = std::chrono::microseconds(1000000u / fps);
++    const auto now = std::chrono::steady_clock::now();
++    if (deadline.time_since_epoch().count() == 0) deadline = now;
++    deadline += period;
++    if (deadline <= now) {
++        deadline = now;
++        return;
++    }
++    constexpr auto spin_margin = std::chrono::microseconds(1500);
++    if (deadline - now > spin_margin) std::this_thread::sleep_until(deadline - spin_margin);
++    while (std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
++}
++
+ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
++    draw_fps(r);
++    pace_present();
+     eglSwapBuffers(r.display, r.surface);
+     const auto now = std::chrono::steady_clock::now();
+     if (r.fps_frames == 0u && r.fps_start.time_since_epoch().count() == 0) r.fps_start = now;
+     ++r.fps_frames;
++    if (r.shown_start.time_since_epoch().count() == 0) r.shown_start = now;
++    else ++r.shown_frames;
++    if (now - r.shown_start >= std::chrono::seconds(1)) {
++        r.shown_fps = r.shown_frames / std::chrono::duration<double>(now - r.shown_start).count();
++        r.shown_frames = 0u;
++        r.shown_start = now;
++    }
+     r.fps_psp_draws += psp_draws;
+     r.fps_gl_draws += gl_draws;
+     const double seconds = std::chrono::duration<double>(now - r.fps_start).count();
+@@ -3359,6 +3458,19 @@ bool cull_enabled() {
+     return enabled;
+ }
+ 
++// VCS_GLES_MIN_PIXELS=<n> (from LCS 0045): also drop a mesh whose bounding
++// box, wholly in front of the camera, projects to less than n pixels along
++// both screen axes (distant small props, far-away detail). Unset or 0: off.
++float min_pixels() {
++    static const float pixels = [] {
++        const char *text = std::getenv("VCS_GLES_MIN_PIXELS");
++        if (text == nullptr || *text == '\0') return 0.0f;
++        const float value = std::strtof(text, nullptr);
++        return std::isfinite(value) && value > 0.0f ? value : 0.0f;
++    }();
++    return pixels;
++}
++
+ bool off_screen(const Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGpuHardwareTransform &hw,
+                 const std::array<float, 3> &low, const std::array<float, 3> &high) {
+     // Consecutive draws share a target: one hash find per target change.
+@@ -3381,7 +3493,10 @@ bool off_screen(const Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGp
+     // Outside when all 8 corners are on the far side of one plane:
+     // w + x, w - x, w + y, w - y >= 0 and (depth clip) z >= 0, w - z >= 0.
+     std::uint32_t outside = 0x3Fu;
+-    for (std::uint32_t corner = 0u; corner < 8u && outside != 0u; ++corner) {
++    const float small = min_pixels();
++    bool in_front = small > 0.0f;
++    float ndc_low[2] = {INFINITY, INFINITY}, ndc_high[2] = {-INFINITY, -INFINITY};
++    for (std::uint32_t corner = 0u; corner < 8u && (outside != 0u || in_front); ++corner) {
+         const float p[4] = {(corner & 1u) ? high[0] : low[0], (corner & 2u) ? high[1] : low[1],
+                             (corner & 4u) ? high[2] : low[2], 1.0f};
+         const auto dot = [&](const std::array<float, 4> &row) {
+@@ -3396,8 +3511,24 @@ bool off_screen(const Gles2State &s, const GeGpuDrawDescriptor &draw, const GeGp
+         if (hw.depth_clip_enabled && z < 0.0f) mask |= 16u;
+         if (hw.depth_clip_enabled && w - z < 0.0f) mask |= 32u;
+         outside &= mask;
++        if (in_front) {
++            if (w < 0.01f) {
++                in_front = false;
++            } else {
++                const float inv = 1.0f / w;
++                ndc_low[0] = std::min(ndc_low[0], x * inv); ndc_high[0] = std::max(ndc_high[0], x * inv);
++                ndc_low[1] = std::min(ndc_low[1], y * inv); ndc_high[1] = std::max(ndc_high[1], y * inv);
++            }
++        }
+     }
+-    return outside != 0u;
++    if (outside != 0u) return true;
++    // Perspective views only (w depends on the vertex): HUD and other flat
++    // drawing keep every element.
++    const bool perspective = rows[3][0] != 0.0f || rows[3][1] != 0.0f || rows[3][2] != 0.0f;
++    // Clip space spans 2 across the target: pixels = ndc extent * size / 2.
++    return in_front && perspective &&
++           (ndc_high[0] - ndc_low[0]) * static_cast<float>(cached_width) < 2.0f * small &&
++           (ndc_high[1] - ndc_low[1]) * static_cast<float>(cached_height) < 2.0f * small;
+ }
+ 
+ // Appends a hardware-transform draw: fill(out) writes vertex_count vertices

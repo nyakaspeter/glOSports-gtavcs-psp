@@ -1,0 +1,388 @@
+diff --git a/profiles/vcs/host/ge_renderer.cpp b/profiles/vcs/host/ge_renderer.cpp
+index b547aa7..7d4429f 100644
+--- a/profiles/vcs/host/ge_renderer.cpp
++++ b/profiles/vcs/host/ge_renderer.cpp
+@@ -231,7 +231,9 @@ bool gpu_hardware_transform_enabled() noexcept {
+         // PSPRECOMP_GE_GPU_HW_TRANSFORM=1 opts in explicitly for testing (the
+         // env var above already handles that -- this default is only what
+         // happens when nothing overrides it).
++#if !defined(VCS_GLES2_GE_BACKEND)  // GLES 2 reports itself as Vulkan; its path is tested
+         if (ge_gpu_backend_report().active == GeGpuBackendKind::Vulkan) return false;
++#endif
+         const vcs::VcsConfiguration &config = vcs::vcs_configuration();
+         return config.initialized && config.rendering.hardware_transform;
+     }();
+@@ -2017,6 +2019,14 @@ bool software_raster_skipped(const std::array<std::uint32_t, 256> &commands) noe
+         // actually depends on one is the risk to watch for -- if a water/
+         // reflection/mirror-type effect goes wrong, that is where to look
+         // first.
++#if defined(VCS_GLES2_GE_BACKEND)
++        // The GLES 2 backend draws every target on the GPU and serves draws
++        // that sample a target (framebuffer feedback) from its GPU copy, so
++        // the CPU rasterizer has nothing left to do. Without this the game
++        // thread rasterized VCS's whole scene (its working buffer is not the
++        // displayed one) on the CPU as well.
++        return true;
++#endif
+         const VcsConfiguration &cfg = vcs_configuration();
+         return cfg.initialized && cfg.rendering.backend == RenderingBackend::DirectX12 &&
+                cfg.rendering.dx12_ge_color &&
+@@ -2215,6 +2225,20 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
+     const auto size = static_cast<std::size_t>(bytes);
+     const std::uint8_t *pixels = memory.raw_pointer(texture.base, size);
+     if (pixels == nullptr) return 0u;
++    // Unchanged while none of its pages was written since (the guest memory's
++    // page generations; ga36-lcs-recomp-port 0024 does this for palettes):
++    // hashing up to 4 KB with 64-bit multiplies for every texture every frame
++    // was a measurable share of the game thread on 32-bit ARM.
++    struct CachedSignature {
++        std::uint32_t base{}, size{}, width{}, height{};
++        std::uint64_t pages{}, hash{};
++    };
++    static thread_local std::array<CachedSignature, 1024> signature_cache{};
++    CachedSignature &cached = signature_cache[((texture.base >> 4u) ^ (texture.base >> 14u) ^ static_cast<std::uint32_t>(size)) & 1023u];
++    const std::uint64_t pages = memory.range_generation(texture.base, size);
++    if (cached.hash != 0u && cached.base == texture.base && cached.size == size && cached.width == texture.width &&
++        cached.height == texture.height && cached.pages == pages)
++        return cached.hash;
+ 
+     // Full hash for small dynamic surfaces; evenly distributed cache-line
+     // samples for large world textures. Stage 40 mixed one byte at a time, so a
+@@ -2255,7 +2279,9 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
+     hash ^= static_cast<std::uint64_t>(size) +
+             (static_cast<std::uint64_t>(texture.width) << 32u) + texture.height;
+     hash *= 1099511628211ull;
+-    return hash == 0u ? 1u : hash;
++    if (hash == 0u) hash = 1u;
++    cached = {texture.base, static_cast<std::uint32_t>(size), texture.width, texture.height, pages, hash};
++    return hash;
+ }
+ 
+ Color read_clut_fast(const psprecomp::GuestMemory &memory,
+@@ -3584,6 +3610,9 @@ void accumulate_gpu_prepared_triangles(
+     try {
+         vertices.clear();
+         vertices.reserve(triangles.size() * 3u);
++        // Per draw, not per vertex: the fog colour goes through the sky palette.
++        const std::uint32_t alpha_control = pack_gpu_alpha_control(effective_draw);
++        const std::uint32_t fog_control = pack_gpu_fog_control(effective_draw);
+         for (const PreparedScreenTriangle &triangle : triangles) {
+             Color ca = triangle.flat_shading ? triangle.provoking_color : triangle.a.color;
+             Color cb = triangle.flat_shading ? triangle.provoking_color : triangle.b.color;
+@@ -3605,16 +3634,16 @@ void accumulate_gpu_prepared_triangles(
+             }
+             vertices.push_back({triangle.a.x, triangle.a.y, triangle.a.z, triangle.a.w,
+                                 pack_gpu_color(ca), triangle.a.u, triangle.a.v,
+-                                pack_gpu_alpha_control(effective_draw), 0u, effective_draw.texture_env,
+-                                triangle.a.fog_factor, pack_gpu_fog_control(effective_draw), triangle.a.q});
++                                alpha_control, 0u, effective_draw.texture_env,
++                                triangle.a.fog_factor, fog_control, triangle.a.q});
+             vertices.push_back({triangle.b.x, triangle.b.y, triangle.b.z, triangle.b.w,
+                                 pack_gpu_color(cb), triangle.b.u, triangle.b.v,
+-                                pack_gpu_alpha_control(effective_draw), 0u, effective_draw.texture_env,
+-                                triangle.b.fog_factor, pack_gpu_fog_control(effective_draw), triangle.b.q});
++                                alpha_control, 0u, effective_draw.texture_env,
++                                triangle.b.fog_factor, fog_control, triangle.b.q});
+             vertices.push_back({triangle.c.x, triangle.c.y, triangle.c.z, triangle.c.w,
+                                 pack_gpu_color(cc), triangle.c.u, triangle.c.v,
+-                                pack_gpu_alpha_control(effective_draw), 0u, effective_draw.texture_env,
+-                                triangle.c.fog_factor, pack_gpu_fog_control(effective_draw), triangle.c.q});
++                                alpha_control, 0u, effective_draw.texture_env,
++                                triangle.c.fog_factor, fog_control, triangle.c.q});
+         }
+         fps_overlay_observe_draw(effective_draw, static_cast<std::uint32_t>(vertices.size()));
+         ge_gpu_backend_accumulate_color_triangles(effective_draw, vertices);
+@@ -4149,6 +4178,78 @@ bool test_ge_bounding_box(const psprecomp::GuestMemory &memory,
+     return true;
+ }
+ 
++// PSPRECOMP_GE_GPU_RAW: 0 off, 1 (default) every eligible layout, 2 without
++// skinned ones (weights stay on the CPU). ga36-lcs-recomp-port 0025.
++std::uint32_t raw_gpu_decode_mode() noexcept {
++    static const std::uint32_t mode = [] {
++        const char *text = std::getenv("PSPRECOMP_GE_GPU_RAW");
++        if (text == nullptr || *text == '\0') return 1u;
++        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
++    }();
++    return mode;
++}
++
++// The raw path's uniform block (see GeGpuRawState): matrices as rows so the
++// shader transforms with dot products, the prepared lighting as is.
++void fill_raw_state(GeGpuRawState &out, GeGpuRawLayout &variant, const GeTransformState &transform,
++                    const PreparedLighting &lighting, bool lighting_on,
++                    const std::array<std::uint32_t, 256> &commands) noexcept {
++    auto &u = out.uniforms;
++    const auto rows = [&](std::size_t first, const float *m) {
++        for (std::size_t r = 0u; r < 3u; ++r) u[first + r] = {m[r], m[3u + r], m[6u + r], m[9u + r]};
++    };
++    rows(0u, transform.world.data());
++    rows(3u, transform.texture.data());
++    u[6] = {lighting.material_ambient.r, lighting.material_ambient.g, lighting.material_ambient.b,
++            lighting.material_ambient.a};
++    u[7] = {lighting.material_diffuse.r, lighting.material_diffuse.g, lighting.material_diffuse.b, 0.0f};
++    u[8] = {lighting.material_specular.r, lighting.material_specular.g, lighting.material_specular.b, 0.0f};
++    u[9] = {lighting.emissive.r, lighting.emissive.g, lighting.emissive.b, 0.0f};
++    u[10] = {lighting.global_ambient.r, lighting.global_ambient.g, lighting.global_ambient.b,
++             lighting.global_ambient.a};
++    u[11] = {lighting.specular_exponent, static_cast<float>(lighting.material_update),
++             (data24(commands[0x51u]) & 1u) != 0u ? -1.0f : 1.0f, lighting_on ? 1.0f : 0.0f};
++    const Color constant = material_ambient_color(commands);
++    u[12] = {constant.r / 255.0f, constant.g / 255.0f, constant.b / 255.0f, constant.a / 255.0f};
++    const std::uint32_t shade = data24(commands[0xC1u]);
++    const std::uint32_t uv_mode = data24(commands[0xC0u]);
++    u[13] = {static_cast<float>(uv_mode & 3u), static_cast<float>(shade & 3u),
++             static_cast<float>((shade >> 8u) & 3u), static_cast<float>((uv_mode >> 8u) & 3u)};
++    const auto light_vector = [&](std::uint32_t light) {
++        return normalized_or_001(Vec3{
++            decode_float24(data24(commands[0x63u + light * 3u])),
++            decode_float24(data24(commands[0x64u + light * 3u])),
++            decode_float24(data24(commands[0x65u + light * 3u])),
++        });
++    };
++    const Vec3 shade_s = light_vector(shade & 3u);
++    const Vec3 shade_t = light_vector((shade >> 8u) & 3u);
++    u[62] = {shade_s.x, shade_s.y, shade_s.z, 0.0f};
++    u[63] = {shade_t.x, shade_t.y, shade_t.z, 0.0f};
++    variant.lights = 0u;
++    variant.light_point = variant.light_spot = variant.light_specular = variant.light_pow = false;
++    for (std::size_t i = 0u; i < 4u; ++i) {
++        const PreparedLight &light = lighting.lights[i];
++        if (!lighting_on || !lighting.enabled || !light.enabled) continue;
++        const std::size_t base = kGeGpuRawLightBase + variant.lights * 6u;
++        ++variant.lights;
++        variant.light_point |= light.type != 0u;
++        variant.light_spot |= light.type >= 2u;
++        variant.light_specular |= light.computation == 1u;
++        variant.light_pow |= light.computation == 2u;
++        u[base] = {light.vector.x, light.vector.y, light.vector.z, static_cast<float>(light.type)};
++        u[base + 1u] = {light.attenuation.x, light.attenuation.y, light.attenuation.z,
++                        static_cast<float>(light.computation)};
++        u[base + 2u] = {light.spot_direction.x, light.spot_direction.y, light.spot_direction.z, light.cutoff};
++        u[base + 3u] = {light.ambient.r, light.ambient.g, light.ambient.b, light.exponent};
++        u[base + 4u] = {light.diffuse.r, light.diffuse.g, light.diffuse.b,
++                        lighting.enabled && light.enabled ? 1.0f : 0.0f};
++        u[base + 5u] = {light.specular.r, light.specular.g, light.specular.b, 0.0f};
++    }
++    for (std::size_t bone = 0u; bone < 8u; ++bone)
++        rows(kGeGpuRawBoneBase + bone * 3u, transform.bones.data() + bone * 12u);
++}
++
+ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                          const std::array<std::uint32_t, 256> &commands,
+                          const GeTransformState &transform,
+@@ -4294,8 +4395,24 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
+             const std::uint32_t offset_bytes = first * entry_bytes;
+             const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
+-            if (const std::uint8_t *clut = memory.raw_pointer(
+-                    gpu_draw.clut_address + offset_bytes, clut_bytes)) {
++            // Cached per palette while its pages are unwritten (ported from
++            // ga36-lcs-recomp-port 0011/0024): GTA draws with hundreds of
++            // palettes a frame and rewrites few of them.
++            struct ClutChecksum {
++                std::uint32_t address{};
++                std::uint32_t bytes{};
++                std::uint64_t pages{};
++                std::uint32_t checksum{};
++                bool valid{};
++            };
++            static thread_local std::array<ClutChecksum, 1024> clut_cache{};
++            const std::uint32_t clut_start = gpu_draw.clut_address + offset_bytes;
++            ClutChecksum &cached_clut = clut_cache[((clut_start >> 4u) ^ (clut_start >> 14u)) & 1023u];
++            const std::uint64_t clut_pages = memory.range_generation(clut_start, clut_bytes);
++            if (cached_clut.valid && cached_clut.address == clut_start && cached_clut.bytes == clut_bytes &&
++                cached_clut.pages == clut_pages) {
++                gpu_draw.clut_checksum = cached_clut.checksum;
++            } else if (const std::uint8_t *clut = memory.raw_pointer(clut_start, clut_bytes)) {
+                 std::uint32_t checksum = 2166136261u;
+                 std::uint32_t offset = 0u;
+                 for (; offset + 4u <= clut_bytes; offset += 4u) {
+@@ -4313,6 +4430,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                     checksum *= 16777619u;
+                 }
+                 gpu_draw.clut_checksum = checksum;
++                cached_clut = {clut_start, clut_bytes, clut_pages, checksum, true};
+             }
+         }
+         // All texture identity fields, including the mutable CLUT checksum, are
+@@ -4337,6 +4455,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             gpu_draw.texture_content_signature = any_signature ? signature : 0u;
+         }
+         ge_gpu_backend_record_draw(gpu_draw);
++#if !defined(VCS_GLES2_GE_BACKEND)  // GLES 2's observe_camera is empty: no viewport decodes and camera loads per PRIM
+         if (!gpu_draw.through && !gpu_draw.clear_mode &&
+             primitive >= 3u && primitive <= 5u) {
+             const std::array<float, 6> cloud_viewport{
+@@ -4362,6 +4481,7 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+                                           cloud_viewport, cloud_camera_position,
+                                           gpu_draw, count);
+         }
++#endif
+         if (!gpu_draw.clear_mode && primitive >= 3u && primitive <= 6u)
+             fps_overlay_observe_draw(gpu_draw, count);
+         if (!gpu_draw.through && !gpu_draw.clear_mode &&
+@@ -4743,6 +4863,106 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             triangle_indices.clear();
+         }
+ 
++        // Every other layout as stored, decoded, skinned and lit by the vertex
++        // shader instead of decode_model_vertex_for_gpu on the CPU (the GE
++        // thread's largest cost in cutscenes). Not: morphing, flat shading (the
++        // last vertex's colour per triangle), textures not decoded yet, the
++        // debug colour modes. ga36-lcs-recomp-port 0025.
++        const std::uint32_t raw_mode = raw_gpu_decode_mode();
++        const bool raw_candidate = raw_mode != 0u && contiguous_raw != nullptr &&
++            !packed_0115_candidate && layout.morph_count == 1u && !flat_shading &&
++            uv_generation <= 2u && layout.position_type != 0u &&
++            (layout.weight_type == 0u || (raw_mode == 1u && layout.weight_count <= 8u)) &&
++            layout.stride <= 255u && decode_count <= 65536u &&
++            !gpu_force_white_vertex_colors_enabled() && !gpu_geometry_debug_colors_enabled() &&
++            (!effective_draw.texture_enabled || sampled_texture_ready);
++        if (raw_candidate) {
++            GeGpuRawLayout raw_layout{};
++            raw_layout.stride = layout.stride;
++            raw_layout.position_type = static_cast<std::uint8_t>(layout.position_type);
++            raw_layout.normal_type = static_cast<std::uint8_t>(layout.normal_type);
++            raw_layout.tc_type = static_cast<std::uint8_t>(layout.tc_type);
++            raw_layout.color_type = static_cast<std::uint8_t>(layout.color_type);
++            raw_layout.weight_type = static_cast<std::uint8_t>(layout.weight_type);
++            raw_layout.weight_count = static_cast<std::uint8_t>(layout.weight_type != 0u ? layout.weight_count : 0u);
++            raw_layout.position_offset = static_cast<std::uint8_t>(layout.position_offset);
++            raw_layout.normal_offset = static_cast<std::uint8_t>(layout.normal_offset);
++            raw_layout.tc_offset = static_cast<std::uint8_t>(layout.tc_offset);
++            raw_layout.color_offset = static_cast<std::uint8_t>(layout.color_offset);
++            raw_layout.weight_offset = static_cast<std::uint8_t>(layout.weight_offset);
++            raw_layout.lit = hw_lighting_on_cpu;
++            raw_layout.uv_generation = static_cast<std::uint8_t>(uv_generation);
++            // The backend keeps one copy of the uniform block per change; VCS's
++            // executor has no matrix revision counter, so a change is found by
++            // comparing the block (1 KB) with the previous draw's.
++            static thread_local GeGpuRawState raw_state{};
++            static thread_local GeGpuRawState raw_previous{};
++            static thread_local bool raw_previous_valid = false;
++            GeGpuRawLayout variant{};
++            fill_raw_state(raw_state, variant, transform, prepared_lighting, hw_lighting_on_cpu, commands);
++            const bool state_changed = !raw_previous_valid ||
++                std::memcmp(&raw_state, &raw_previous, sizeof(GeGpuRawState)) != 0;
++            if (state_changed) {
++                raw_previous = raw_state;
++                raw_previous_valid = true;
++            }
++            raw_layout.lights = variant.lights;
++            raw_layout.light_point = variant.light_point;
++            raw_layout.light_spot = variant.light_spot;
++            raw_layout.light_specular = variant.light_specular;
++            raw_layout.light_pow = variant.light_pow;
++            GeGpuHardwareTransform raw_hw = build_gpu_hardware_transform(commands, transform, false, false);
++            raw_hw.primitive = primitive == 5u ? 3u : primitive;
++            raw_hw.logical_prim_batches = std::max<std::uint32_t>(1u, logical_primitive_count);
++            raw_hw.unique_vertices_decoded = static_cast<std::uint32_t>(decode_count);
++            raw_hw.index_reuses = count > decode_count ? count - static_cast<std::uint32_t>(decode_count) : 0u;
++            // The stream's triangle indices: lists and strips keep the stream,
++            // fans become a list (as the packed path above).
++            const auto occurrence_index = [&](std::size_t i) -> std::uint32_t {
++                if (!indexed) return static_cast<std::uint32_t>(i);
++                if (contiguous_decode) return occurrence_indices[i] - contiguous_first;
++                return occurrence_remap[i];
++            };
++            const bool identity_stream = !indexed ||
++                (sequential_index_stream && contiguous_first == first_index_value && decode_count == count);
++            const bool direct = direct_nonindexed_gpu_draw_enabled() && (primitive == 3u || primitive == 4u) &&
++                (primitive != 3u || (count % 3u) == 0u) && decode_count == count && identity_stream;
++            if (!direct) {
++                if (primitive == 3u) {
++                    triangle_indices.reserve(count);
++                    for (std::size_t i = 0u; i + 2u < count; i += 3u) {
++                        triangle_indices.push_back(occurrence_index(i));
++                        triangle_indices.push_back(occurrence_index(i + 1u));
++                        triangle_indices.push_back(occurrence_index(i + 2u));
++                    }
++                } else if (primitive == 4u) {
++                    triangle_indices.reserve(count);
++                    for (std::size_t i = 0u; i < count; ++i) triangle_indices.push_back(occurrence_index(i));
++                } else {
++                    triangle_indices.reserve(count > 2u ? (count - 2u) * 3u : 0u);
++                    for (std::size_t i = 1u; i + 1u < count; ++i) {
++                        triangle_indices.push_back(occurrence_index(0u));
++                        triangle_indices.push_back(occurrence_index(i));
++                        triangle_indices.push_back(occurrence_index(i + 1u));
++                    }
++                }
++            }
++            bool accepted = false;
++            {
++                PhaseTimer accumulate_timer(g_ge_gpu_accumulate_ns);
++                accepted = ge_gpu_backend_accumulate_hardware_raw(
++                    effective_draw, raw_hw, raw_layout,
++                    std::span<const std::byte>(reinterpret_cast<const std::byte *>(contiguous_raw), contiguous_raw_bytes),
++                    static_cast<std::uint32_t>(decode_count), triangle_indices, raw_state, state_changed);
++            }
++            if (accepted) {
++                if (collect_diagnostic_stats) stats.decoded_vertices += decode_count;
++                advance_stream();
++                return true;
++            }
++            triangle_indices.clear();
++        }
++
+         // Fallback for lit/skinned/morphed/sparse/debug draws and for any backend
+         // that does not implement the packed 0x0115 stream.
+         decoded_vertices.resize(decode_count);
+@@ -5025,7 +5245,38 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             !(setup.texture_enabled && ge_gpu_backend_is_framebuffer_feedback_texture(gpu_draw));
+         gpu_draw.hud_candidate = widescreen_surface_primitive && !setup.clear_mode && !full_width &&
+             hud_world_effect_exclusion;
+-        if (widescreen_surface_primitive && hud.shrink != 1.0f && !setup.clear_mode && !full_width &&
++        if (widescreen_surface_primitive && hud.shrink < 1.0f && !setup.clear_mode && !full_width &&
++            hud_world_effect_exclusion) {
++            // Narrower than 16:9 (4:3 on goodluckOS): the frame is stretched
++            // more vertically than horizontally, so widening the interface
++            // would push it off the sides. Squeeze it vertically instead,
++            // towards whichever edge each element is anchored to, and its
++            // clip rectangle with it (the radar map clips its tiles with it).
++            const float height = 320.0f;  // VCS composes its frame into 512 x 320
++            float min_y = height;
++            for (const Vertex &vertex : vertices) min_y = std::min(min_y, vertex.y);
++            // Centre of what can be visible below the middle: the clip
++            // rectangle bounds it. Radar tiles are rotated quads far larger
++            // than the radar, clipped to it; by their whole extent some
++            // centred above the middle and were squeezed towards the top,
++            // a strip of the radar map 60 rows above its circle.
++            const float visible_min_y = std::max(min_y, static_cast<float>(setup.scissor_y0));
++            const float visible_max_y = std::min(max_y, static_cast<float>(setup.scissor_y1 + 1));
++            const bool bottom = visible_min_y <= visible_max_y ? visible_min_y + visible_max_y > height
++                                                               : min_y + max_y > height;
++            for (Vertex &vertex : vertices)
++                vertex.y = bottom ? height - (height - vertex.y) * hud.shrink : vertex.y * hud.shrink;
++            const auto squeeze_scissor = [&](std::int32_t value, bool leading) {
++                const float y = static_cast<float>(value);
++                const float moved = bottom ? height - (height - y) * hud.shrink : y * hud.shrink;
++                return static_cast<std::int32_t>(leading ? std::ceil(moved) : std::floor(moved));
++            };
++            setup.scissor_y0 = squeeze_scissor(setup.scissor_y0, true);
++            setup.scissor_y1 = squeeze_scissor(setup.scissor_y1, false);
++            gpu_draw.scissor_y0 = setup.scissor_y0;
++            gpu_draw.scissor_y1 = setup.scissor_y1;
++            gpu_draw.widescreen_hud = true;
++        } else if (widescreen_surface_primitive && hud.shrink != 1.0f && !setup.clear_mode && !full_width &&
+             // Additive depth-tested 2D is not interface, it is the world drawn
+             // in screen space: coronas, headlight glows, lens flares. The guest
+             // already projected those from world positions, so they are correct
+diff --git a/profiles/vcs/host/vcs_sky_palette.hpp b/profiles/vcs/host/vcs_sky_palette.hpp
+index bb71bc9..4d89195 100644
+--- a/profiles/vcs/host/vcs_sky_palette.hpp
++++ b/profiles/vcs/host/vcs_sky_palette.hpp
+@@ -103,8 +103,11 @@ inline void note_game_sky_color(std::uint32_t abgr) noexcept {
+ // and the strength setting) change at most a few times a second. Remember the last
+ // answer per thread and only recompute when an input actually differs.
+ [[nodiscard]] inline std::uint32_t remap_sky_color(std::uint32_t abgr) noexcept {
++    // The configuration is loaded once at start: one out-of-line call, not one
++    // per vertex (ga36-vcs-recomp-port: ~7% of the game thread in a cutscene).
++    static const bool enabled = vcs_configuration().postfx.sky_palette_enabled;
++    if (!enabled) return abgr;
+     const PostFxConfiguration &fx = vcs_configuration().postfx;
+-    if (!fx.sky_palette_enabled) return abgr;
+     const float hours = game_clock_hours();
+     if (hours < 0.0f) return abgr;
+     struct Memo {

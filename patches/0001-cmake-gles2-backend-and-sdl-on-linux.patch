@@ -1,0 +1,58 @@
+diff --git a/profiles/vcs/CMakeLists.txt b/profiles/vcs/CMakeLists.txt
+index 25941ea..8c5bb5d 100644
+--- a/profiles/vcs/CMakeLists.txt
++++ b/profiles/vcs/CMakeLists.txt
+@@ -162,12 +162,15 @@ endif()
+ # PSPRECOMP_VCS_GE_BACKEND=VULKAN or DX12 overrides the choice on Windows.
+ # (PSPRECOMP_VCS_WIN32_VULKAN=ON is still accepted and means VULKAN.)
+ set(PSPRECOMP_VCS_GE_BACKEND "AUTO" CACHE STRING
+-    "GE backend: AUTO, VULKAN or DX12 (DX12 only exists on Windows)")
+-set_property(CACHE PSPRECOMP_VCS_GE_BACKEND PROPERTY STRINGS AUTO VULKAN DX12)
++    "GE backend: AUTO, VULKAN, DX12 (Windows only) or GLES2 (Linux only)")
++set_property(CACHE PSPRECOMP_VCS_GE_BACKEND PROPERTY STRINGS AUTO VULKAN DX12 GLES2)
+ if(PSPRECOMP_VCS_WIN32_VULKAN)
+     set(PSPRECOMP_VCS_GE_BACKEND "VULKAN")
+ endif()
+-if(NOT WIN32)
++if(NOT WIN32 AND NOT APPLE AND PSPRECOMP_VCS_GE_BACKEND STREQUAL "GLES2")
++    # GLES 2 on EGL fbdev (ARM's Mali-400 driver), SDL2 for input and audio.
++    set(VCS_BACKEND_CHOICE "GLES2")
++elseif(NOT WIN32)
+     set(VCS_BACKEND_CHOICE "VULKAN")
+ elseif(PSPRECOMP_VCS_GE_BACKEND STREQUAL "DX12" OR PSPRECOMP_VCS_GE_BACKEND STREQUAL "VULKAN")
+     set(VCS_BACKEND_CHOICE "${PSPRECOMP_VCS_GE_BACKEND}")
+@@ -188,6 +191,10 @@ message(STATUS "VCS graphics backend: ${VCS_BACKEND_CHOICE}")
+ if(VCS_BACKEND_CHOICE STREQUAL "DX12")
+     set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_dx12.cpp)
+     set(VCS_USE_VULKAN_BACKEND FALSE)
++elseif(VCS_BACKEND_CHOICE STREQUAL "GLES2")
++    set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_gles2.cpp)
++    set(VCS_USE_VULKAN_BACKEND FALSE)
++    set(VCS_USE_GLES2_BACKEND TRUE)
+ else()
+     set(VCS_GPU_BACKEND_SOURCE host/ge_gpu_backend_vulkan.cpp)
+     set(VCS_USE_VULKAN_BACKEND TRUE)
+@@ -283,6 +290,9 @@ if(WIN32)
+     set(VCS_DISPLAY_WINDOW_SOURCE platform/windows/display_window_win32.cpp)
+ elseif(APPLE)
+     set(VCS_DISPLAY_WINDOW_SOURCE platform/macos/display_window_sdl.cpp)
++elseif(VCS_USE_GLES2_BACKEND)
++    # SDL2 controller input with the picture drawn by the GLES 2 backend.
++    set(VCS_DISPLAY_WINDOW_SOURCE platform/linux/display_window_sdl.cpp)
+ else()
+     set(VCS_DISPLAY_WINDOW_SOURCE platform/generic/display_window_stub.cpp)
+ endif()
+@@ -395,6 +405,13 @@ function(vcs_target_common target)
+             target_link_libraries(${target} PRIVATE ${VCS_SYSTEM_${VCS_FFMPEG_LIB}})
+         endforeach()
+     else()
++        if(VCS_USE_GLES2_BACKEND)
++            find_package(PkgConfig REQUIRED)
++            pkg_check_modules(VCS_GLES2 REQUIRED IMPORTED_TARGET egl glesv2 sdl2)
++            find_package(Threads REQUIRED)
++            target_compile_definitions(${target} PRIVATE VCS_GLES2_GE_BACKEND=1 VCS_SDL_AUDIO=1)
++            target_link_libraries(${target} PRIVATE PkgConfig::VCS_GLES2 Threads::Threads)
++        endif()
+         # The profile vendors FFmpeg 7 headers. Some validation hosts install only
+         # the versioned runtime sonames (without development symlinks), so accept
+         # the matching FFmpeg 7 ABI names as fallbacks.

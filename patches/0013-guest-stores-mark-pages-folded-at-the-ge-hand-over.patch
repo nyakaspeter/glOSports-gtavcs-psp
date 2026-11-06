@@ -1,0 +1,135 @@
+diff --git a/include/psprecomp/guest_memory.hpp b/include/psprecomp/guest_memory.hpp
+index 459ee7a..e3a554a 100644
+--- a/include/psprecomp/guest_memory.hpp
++++ b/include/psprecomp/guest_memory.hpp
+@@ -85,25 +85,28 @@ public:
+         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
+             return GuestMemory::read_le32(window_ + (address & kWindowMask));
+         }
+-        // Every guest store also bumps its 64 KB page's generation (one load,
+-        // add and store on a 32 KB table): a host cache keyed by a guest
+-        // address range can then tell "unchanged since I read it" from one
+-        // compare per page instead of re-hashing the bytes (see
+-        // range_generation).
++        // Every guest store also marks its 64 KB page written (one byte store
++        // of a constant into an 8 KB table; the page generations it used to
++        // bump cost a load, an add and a store, a dependent pair on the same
++        // word for consecutive stores). fold_dirty_pages() turns the marks into
++        // generation bumps before a host cache looks (the GE thread, at each
++        // display list hand-over): a cache keyed by a guest address range can
++        // then tell "unchanged since I read it" from one compare per page
++        // instead of re-hashing the bytes (see range_generation).
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
+             const std::uint32_t offset = address & kWindowMask;
+             window_[offset] = value;
+-            ++generations_[offset >> kPageShift];
++            dirty_[offset >> kPageShift] = 1u;
+         }
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store16(std::uint32_t address, std::uint16_t value) const {
+             const std::uint32_t offset = address & kWindowMask;
+             GuestMemory::write_le16(window_ + offset, value);
+-            ++generations_[offset >> kPageShift];
++            dirty_[offset >> kPageShift] = 1u;
+         }
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store32(std::uint32_t address, std::uint32_t value) const {
+             const std::uint32_t offset = address & kWindowMask;
+             GuestMemory::write_le32(window_ + offset, value);
+-            ++generations_[offset >> kPageShift];
++            dirty_[offset >> kPageShift] = 1u;
+         }
+ #if defined(__ARM_NEON)
+         // lv.q / sv.q as one 16-byte access (AllegrexContext::vfpu_lvq / vfpu_svq
+@@ -115,16 +118,16 @@ public:
+         PSPRECOMP_MEMORY_FAST_PATH void aot_store128(std::uint32_t address, float32x4_t value) const {
+             const std::uint32_t offset = address & kWindowMask;
+             vst1q_u8(window_ + offset, vreinterpretq_u8_f32(value));
+-            ++generations_[offset >> kPageShift];
++            dirty_[offset >> kPageShift] = 1u;
+         }
+ #endif
+ 
+     private:
+         friend class GuestMemory;
+-        AotFastView(std::uint8_t *window, std::uint32_t *generations) noexcept
+-            : window_(window), generations_(generations) {}
++        AotFastView(std::uint8_t *window, std::uint8_t *dirty) noexcept
++            : window_(window), dirty_(dirty) {}
+         std::uint8_t *window_{};
+-        std::uint32_t *generations_{};
++        std::uint8_t *dirty_{};
+     };
+ 
+     static constexpr std::uint32_t kWindowMask = 0x1FFFFFFFu;
+@@ -133,14 +136,34 @@ public:
+     static constexpr std::size_t kPageCount = kWindowBytes >> kPageShift;
+ 
+     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
+-        return AotFastView(window_, generations_.data());
++        return AotFastView(window_, dirty_.data());
++    }
++
++    // The generated code's stores mark pages in dirty_; this bumps the
++    // generation of every marked page once and clears the marks. Called on the
++    // thread that runs the guest, at each point from which a host cache may
++    // read data the guest wrote (the GE hand-over), with no reader running.
++    void fold_dirty_pages() noexcept {
++        std::uint8_t *const marks = dirty_.data();
++        for (std::size_t base = 0u; base < kPageCount; base += 8u) {
++            std::uint64_t word;
++            std::memcpy(&word, marks + base, sizeof(word));
++            if (word == 0u) continue;
++            for (std::size_t page = base; page < base + 8u; ++page) {
++                if (marks[page] != 0u) {
++                    marks[page] = 0u;
++                    ++generations_[page];
++                }
++            }
++        }
+     }
+ 
+     // Sum of the page generations a range touches. Host writes bump them too,
+-    // so an equal sum before and after means the bytes are unchanged. Not
+-    // atomic: a reader on another thread may see a stale value and re-read the
+-    // data once more, never "unchanged" for bytes written before its own read
+-    // of the sum completed on the same thread.
++    // and the generated code's writes once folded (fold_dirty_pages), so an
++    // equal sum before and after means the bytes are unchanged. Not atomic: a
++    // reader on another thread may see a stale value and re-read the data once
++    // more, never "unchanged" for bytes written before its own read of the sum
++    // completed on the same thread.
+     [[nodiscard]] std::uint64_t range_generation(std::uint32_t address, std::size_t length) const noexcept {
+         const std::uint32_t first = (address & kWindowMask) >> kPageShift;
+         const std::uint32_t last = static_cast<std::uint32_t>(((address & kWindowMask) + (length == 0u ? 0u : length - 1u)) >> kPageShift);
+@@ -364,6 +387,7 @@ private:
+     std::span<std::uint8_t> vram_;
+     std::span<std::uint8_t> bytes_;
+     std::vector<std::uint32_t> generations_ = std::vector<std::uint32_t>(kPageCount, 0u);
++    std::vector<std::uint8_t> dirty_ = std::vector<std::uint8_t>(kPageCount, 0u);
+     // Cached view of bytes_ for the inline fast paths.  Neither region is ever
+     // resized after construction, so these stay valid for the object's life.
+     //
+diff --git a/profiles/vcs/host/vcs_profile.cpp b/profiles/vcs/host/vcs_profile.cpp
+index c24e537..373c9d2 100644
+--- a/profiles/vcs/host/vcs_profile.cpp
++++ b/profiles/vcs/host/vcs_profile.cpp
+@@ -5445,6 +5445,10 @@ std::uint32_t allocate_ge_list_id() {
+ 
+ 
+ void enqueue_ge_display_list(psprecomp::Runtime &runtime, psprecomp::AllegrexContext &ctx, bool head) {
++    // The guest's stores since the last hand-over become page generation
++    // bumps before the GE worker can reach the commands that use them (its
++    // texture-signature and palette caches compare page generations).
++    runtime.memory().fold_dirty_pages();
+     const std::uint32_t list_address = ctx.gpr[4] & 0x0FFFFFFFu;
+     const std::uint32_t stall_address = ctx.gpr[5] & 0x0FFFFFFFu;
+     const std::int32_t callback_id = static_cast<std::int32_t>(ctx.gpr[6]);
+@@ -7404,6 +7408,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+                 return;
+             }
+             const std::uint32_t new_stall = ctx.gpr[5] & 0x0FFFFFFFu;
++            // As at enqueue: the guest's stores up to here become generation
++            // bumps before the worker sees the commands the new stall opens.
++            rt.memory().fold_dirty_pages();
+             if (ge_async_running()) {
+                 ge_async_start_worker(rt);
+                 bool resumed = false;

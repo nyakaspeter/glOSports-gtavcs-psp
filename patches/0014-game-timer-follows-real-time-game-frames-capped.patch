@@ -1,0 +1,138 @@
+diff --git a/profiles/vcs/host/vcs_profile.cpp b/profiles/vcs/host/vcs_profile.cpp
+index 373c9d2..fb5c468 100644
+--- a/profiles/vcs/host/vcs_profile.cpp
++++ b/profiles/vcs/host/vcs_profile.cpp
+@@ -2852,8 +2852,62 @@ std::uint32_t execute_savedata_operation(psprecomp::Runtime &runtime, std::uint3
+     }
+ }
+ 
++// ---- The game's timer (VCS_SMOOTH_CLOCK, from LCS 0044) ----
++// The guest clock moves to the next vblank boundary at each vblank wait
++// (limit_frame_rate() first adds what the frame ran late), so the game, which
++// reads it once a frame for its time step, simulates whole vblanks (33 or 50
++// ms) while the real frames take, say, 37: uneven motion between evenly
++// spaced frames. VCS_SMOOTH_CLOCK=1 gives the game's timer reads
++// (sceKernelGetSystemTime/Wide/Low, the pad's sample times) the guest clock
++// plus an offset, set at each vblank wait so that the game resumes at the real
++// time; the scheduler, the thread delays, the audio and the vblank interrupt
++// keep the guest clock. The offset stays within four vblanks (more is a stall:
++// the clocks are put level again) and never makes the timer go back.
++bool smooth_clock_enabled() {
++    static const bool enabled = [] {
++        const char *text = VCS_ENV("VCS_SMOOTH_CLOCK");
++        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
++    }();
++    return enabled;
++}
++
++std::int64_t game_clock_offset_us = 0;
++std::uint64_t game_clock_last_us = 0u;  // the latest time handed to the game
++bool game_clock_based = false;
++std::uint64_t game_clock_real_base_us = 0u;
++
++std::uint64_t steady_now_us() {
++    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
++        std::chrono::steady_clock::now().time_since_epoch()).count());
++}
++
+ std::uint64_t system_time_microseconds() {
+-    return virtual_time_us;
++    if (!smooth_clock_enabled()) return virtual_time_us;
++    const std::int64_t shifted = static_cast<std::int64_t>(virtual_time_us) + game_clock_offset_us;
++    std::uint64_t time = shifted > 0 ? static_cast<std::uint64_t>(shifted) : 0u;
++    if (time < game_clock_last_us) time = game_clock_last_us;
++    game_clock_last_us = time;
++    return time;
++}
++
++// At a vblank wait, with the guest clock the thread resumes at.
++void game_clock_at_vblank_wait(std::uint64_t resume_virtual_us) {
++    if (!smooth_clock_enabled()) return;
++    const std::uint64_t real = steady_now_us();
++    if (!game_clock_based) {
++        game_clock_real_base_us = real - resume_virtual_us;
++        game_clock_based = true;
++    }
++    constexpr std::int64_t kLimit = 4 * 16683;
++    std::int64_t target = static_cast<std::int64_t>(real - game_clock_real_base_us) -
++                          static_cast<std::int64_t>(resume_virtual_us);
++    if (target > kLimit || target < -kLimit) {
++        game_clock_real_base_us = real - resume_virtual_us;
++        target = 0;
++    }
++    const std::int64_t no_going_back =
++        static_cast<std::int64_t>(game_clock_last_us) - static_cast<std::int64_t>(resume_virtual_us);
++    game_clock_offset_us = std::max(target, no_going_back);
+ }
+ 
+ std::uint32_t audio_remaining_samples(const AudioChannelState &channel) {
+@@ -4730,6 +4784,43 @@ void write_diag_line(const std::ostringstream &line) {
+ // scene. The correction is heavily damped (12.5% of measured drift per
+ // second) and clamped (max 6ms/s) specifically so it cannot outrun normal
+ // sleep/catch-up pacing and cannot itself become a source of stutter.
++// VCS_FPS_CAP=<n>: at most n game frames a second. A game frame is a vblank
++// wait after which the game's frame counter (gp-8852, the one the unlocked
++// limiter reads) has moved; movies and loading screens, which wait every
++// vblank without it moving, are not held back (the old cap waited 1/30 s at
++// every vblank wait and ran movies at half speed). A frame that ran late
++// starts the 1/n s grid again, so the rate never goes over the cap. Runs
++// before limit_frame_rate(), which then moves the guest
++// clock past the time waited, as for any slow frame.
++void cap_game_frames(psprecomp::Runtime &rt, const psprecomp::AllegrexContext &ctx) {
++    static const std::uint32_t fps = [] {
++        const char *text = VCS_ENV("VCS_FPS_CAP");
++        if (text == nullptr || *text == '\0') return 0u;
++        return static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
++    }();
++    if (fps == 0u) return;
++    static std::uint32_t last_counter = 0u;
++    static std::chrono::steady_clock::time_point deadline{};
++    const std::uint32_t address = ctx.gpr[28] + static_cast<std::uint32_t>(kGuestFrameCounterGpOffset);
++    if (!rt.memory().contains(address, 4u)) return;
++    const std::uint32_t counter = rt.memory().load32(address);
++    if (counter == last_counter) return;
++    last_counter = counter;
++    const auto period = std::chrono::microseconds(1000000u / fps);
++    const auto now = std::chrono::steady_clock::now();
++    // A frame that ran late starts the grid again from now: no quick frames
++    // after it to win the time back, so the rate never goes over the cap.
++    if (deadline.time_since_epoch().count() == 0) deadline = now;
++    deadline += period;
++    if (deadline <= now) {
++        deadline = now;
++        return;
++    }
++    constexpr auto spin_margin = std::chrono::microseconds(1500);
++    if (deadline - now > spin_margin) std::this_thread::sleep_until(deadline - spin_margin);
++    while (std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
++}
++
+ void limit_frame_rate() {
+     static const bool enabled = [] {
+         const char *text = VCS_ENV("PSPRECOMP_FRAME_LIMIT");
+@@ -7894,7 +7985,9 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+         // rendered on simple single-buffer screens (loading screens) and
+         // silently vanished the moment real gameplay's multi-pass
+         // compositing started -- confirmed live, exactly that split.
++#if !defined(VCS_GLES2_GE_BACKEND)
+         fps_overlay_render_frame(ge_gpu_backend_last_winner_target());
++#endif
+         {
+             // gp+0x1DE0/0x1DE1: hour and minute (confirmed by Project2DFX).
+             const std::uint32_t clock_gp = ctx.gpr[28];
+@@ -8033,6 +8126,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+         if (gpu_frame_ready) dump_gpu_internal_frame_if_requested(display_vblank_index);
+         if (frame_time_diag_enabled())
+             frame_time_stats.present_time += std::chrono::steady_clock::now() - present_entry;
++        cap_game_frames(rt, ctx);
+         limit_frame_rate();
+         if (display_window_close_requested()) {
+             ctx.set_gpr(2, 0u);
+@@ -8048,6 +8142,7 @@ void install_profile(psprecomp::Runtime &runtime, std::uint32_t user_arena_start
+         }
+         const std::uint64_t period = virtual_vblank_period_us();
+         const std::uint32_t delay = static_cast<std::uint32_t>(period - (virtual_time_us % period));
++        game_clock_at_vblank_wait(virtual_time_us + delay);
+         const auto current = thread_table.threads.find(thread_table.current_uid);
+         if (current == thread_table.threads.end()) {
+             ctx.set_gpr(2, 0x80020198u);
