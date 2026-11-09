@@ -2,5 +2,5 @@
 CATEGORY=Games
 NAME=Grand Theft Auto: Vice City Stories (PSP)
 DESCRIPTION=Running natively via vice-city-stories-recomp
-COMMAND=/home/player/ports/vcs/start.sh
-ICON=/home/player/ports/vcs/icon.png
+COMMAND=/home/player/ports/gtavcs-psp/start.sh
+ICON=/home/player/ports/gtavcs-psp/icon.png

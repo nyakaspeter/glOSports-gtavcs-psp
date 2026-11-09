@@ -4,17 +4,17 @@
 # skip it. Skips the credits with two early presses of A (a later one would skip
 # the cutscene), waits for its first 3D frames (over 200 draws), then averages
 # 10 s of the FPS log 8 s later and prints per-thread CPU.
-#   tools/cutscene-bench.sh <binary in ports/vcs> [VAR=value ...]
-# Needs glos/testing on the console (../goodluckOS-tools/testing-sync.sh vcs).
+#   tools/cutscene-bench.sh <binary in ports/gtavcs-psp> [VAR=value ...]
+# Needs glos/testing on the console (../goodluckOS-tools/testing-sync.sh gtavcs-psp).
 set -eu
 cd "$(dirname "$0")/../.."
 binary=$1
 shift
 GLOS_TIMEOUT=900 python3 -I console.py "/usr/local/bin/appctl stop-application; w=0; while pidof VCSNative $binary >/dev/null && [ \$w -lt 30 ]; do sleep 1; w=\$((w+1)); done; sleep 4
-cd /home/player/ports/vcs
-sed 's|\./VCSNative |./$binary |; s|^cd .*dirname.*|cd /home/player/ports/vcs|' start.sh > glos/testing/start.bench.sh; chmod +x glos/testing/start.bench.sh
-T=/home/player/ports/vcs/glos/testing
-a=0; while [ \$a -lt 3 ]; do /usr/local/bin/appctl launch-application \"cd /home/player/ports/vcs && env VCS_FPS_LOG=1 VCS_BENCH_NEW_GAME=1 $* ./glos/testing/start.bench.sh\"; sleep 20; ps w | grep -q '[.]/$binary' && break; a=\$((a+1)); done
+cd /home/player/ports/gtavcs-psp
+sed 's|\./VCSNative |./$binary |; s|^cd .*dirname.*|cd /home/player/ports/gtavcs-psp|' start.sh > glos/testing/start.bench.sh; chmod +x glos/testing/start.bench.sh
+T=/home/player/ports/gtavcs-psp/glos/testing
+a=0; while [ \$a -lt 3 ]; do /usr/local/bin/appctl launch-application \"cd /home/player/ports/gtavcs-psp && env VCS_FPS_LOG=1 VCS_BENCH_NEW_GAME=1 $* ./glos/testing/start.bench.sh\"; sleep 20; ps w | grep -q '[.]/$binary' && break; a=\$((a+1)); done
 \$T/padpress a 600; sleep 4; \$T/padpress a 600
 i=0; while [ \$i -lt 120 ]; do grep 'glos: FPS' /dev/shm/vcs.log | tail -1 | awk 'BEGIN {r=1} {r=!(\$5 > 200)} END {exit r}' && break; sleep 2; i=\$((i+1)); done
 sleep 8; p=\$(pidof $binary)

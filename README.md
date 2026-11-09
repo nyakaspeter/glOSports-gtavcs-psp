@@ -1,4 +1,4 @@
-# glOSports-vcsrecomp — GTA Vice City Stories, native, on the GA36-MB
+# glOSports-gtavcs-psp — GTA Vice City Stories, native, on the GA36-MB
 
 [vice-city-stories-recomp](https://github.com/OverkillLabs3/vice-city-stories-recomp)
 recompiles the PSP game's MIPS code ahead of time into C++ (no JIT) on top of
@@ -6,7 +6,7 @@ the PSPRecomp runtime, with its own renderer for the PSP's graphics chip
 (Vulkan and DirectX 12 upstream, for Windows and macOS). This repo builds it
 for goodluckOS on the GA36-MB (Allwinner A33, 4× Cortex-A7 at 1.2 GHz,
 Mali-400 MP2 on ARM's closed driver), as a self-contained game folder. It
-follows `glOSports-lcsrecomp`: Liberty City Stories comes from the same
+follows `glOSports-gtalcs-psp`: Liberty City Stories comes from the same
 PSPRecomp lineage, and its GLES 2 renderer is the starting point here.
 
 Needs the **US release, ULUS-10160 (disc v1.03)**: the code was generated
@@ -27,7 +27,7 @@ time, and with a save present the game continues from it after the credits.
 
 ## Game files
 
-From the US v1.03 UMD (ULUS-10160), into `/home/player/ports/vcs/game/`:
+From the US v1.03 UMD (ULUS-10160), into `/home/player/ports/gtavcs-psp/game/`:
 
 | Path | From the disc | Needed |
 |---|---|---|
@@ -38,7 +38,7 @@ From the US v1.03 UMD (ULUS-10160), into `/home/player/ports/vcs/game/`:
 
 `game/PSP/SAVEDATA/` (the saves) is created by the game.
 
-## The game folder on the console (`/home/player/ports/vcs/`)
+## The game folder on the console (`/home/player/ports/gtavcs-psp/`)
 
 | | |
 |---|---|
@@ -46,20 +46,20 @@ From the US v1.03 UMD (ULUS-10160), into `/home/player/ports/vcs/game/`:
 | `lib/` | every library it needs that goodluckOS lacks (Debian trixie's FFmpeg 7.1 and its codec libraries, OpenSSL); `console-libs.txt` is the list of what the console has |
 | `config/VCSNative.ini` | the port's configuration: 4:3 view at 480×360, hardware transform, `FrameRate=60` (the game's own 30 fps limiter rounds a 34 ms frame up to 50), every desktop effect off, no generated mip chains |
 | `game/` | the game files |
-| `game/PSP/SAVEDATA/` | the saves, as in `glOSports-lcsrecomp` (upstream keeps them next to the executable; never touched by tooling) |
+| `game/PSP/SAVEDATA/` | the saves, as in `glOSports-gtalcs-psp` (upstream keeps them next to the executable; never touched by tooling) |
 | `glos/` | the ARM driver set from `goodluckOS-mali-driver` |
 | `start.sh` | sets the environment and ends with `exec ./glos/glos-gpu run mali ./VCSNative game/EBOOT.ELF game` |
-| `icon.png`, `~/.local/share/applications/vcs.puppy` | the launcher entry (the icon is a crop of the game's own `PIC1.PNG`) |
+| `icon.png`, `~/.local/share/applications/gtavcs-psp.puppy` | the launcher entry (the icon is a crop of the game's own `PIC1.PNG`) |
 
 ## Repo layout
 
 | Path | What |
 |---|---|
 | `build.sh` | Clones vice-city-stories-recomp at `8d15d83` into `upstream/`, applies `patches/`, cross-compiles `VCSNative` in Docker (Debian trixie, GCC 14: its FFmpeg 7.1 matches the headers upstream vendors; the console's glibc is 2.44). `build/` is kept: later builds are incremental. `./build.sh <ninja target>…` builds only those. `PGO=generate|use|off` (use is the default once `pgo/` has a profile), `GEN_OPT` (generated units at `-O3` by default; upstream builds them at `-O2`), `BUILD_DIR`. |
-| `package.sh` | `out/vcs/`: the stripped binary, `lib/`, `start.sh`, `config/`, `vcs.puppy`, `icon.png`, `glos/` (from `../goodluckOS-mali-driver/glos`). |
+| `package.sh` | `out/gtavcs-psp/`: the stripped binary, `lib/`, `start.sh`, `config/`, `gtavcs-psp.puppy`, `icon.png`, `glos/` (from `../goodluckOS-mali-driver/glos`). |
 | `patches/` | every change to upstream, applied in order. A kept change is a new patch (`tools/mkpatch.sh NNNN-name <paths under upstream>`) and an entry below. |
 | `config/` | `VCSNative.ini`. |
-| `tools/` | Mac-side scripts (`vfpu-lower.py` and `vfpu-ct-test.py`: the VFPU compile-time forms of 0012 and their check); `tools/src/fbpan.c` (`build-tools.sh` builds `glos/fbpan.so`). The console-side test tools are shared: `../goodluckOS-tools/testing-sync.sh vcs` / `testing-clean.sh vcs`. |
+| `tools/` | Mac-side scripts (`vfpu-lower.py` and `vfpu-ct-test.py`: the VFPU compile-time forms of 0012 and their check); `tools/src/fbpan.c` (`build-tools.sh` builds `glos/fbpan.so`). The console-side test tools are shared: `../goodluckOS-tools/testing-sync.sh gtavcs-psp` / `testing-clean.sh gtavcs-psp`. |
 | `tools/pgo.sh train` | runs the instrumented build on the console through the intro, the opening cutscene and ~60 s of walking, SIGUSR1, fetches its profile into `pgo/` |
 
 ## Build, package, deploy
@@ -67,10 +67,10 @@ From the US v1.03 UMD (ULUS-10160), into `/home/player/ports/vcs/game/`:
 ```sh
 ./build.sh && ./package.sh
 ```
-A first install copies all of `out/vcs/` to `/home/player/ports/vcs/`, the
+A first install copies all of `out/gtavcs-psp/` to `/home/player/ports/gtavcs-psp/`, the
 launcher entry to `/home/player/.local/share/applications/`, then the game
-files to `vcs/game/`. Later: `python3 ../goodluckOS-tools/mtp_send.py / out/vcs/VCSNative`,
-then over the console `mv /home/player/VCSNative /home/player/ports/vcs/`
+files to `gtavcs-psp/game/`. Later: `python3 ../goodluckOS-tools/mtp_send.py / out/gtavcs-psp/VCSNative`,
+then over the console `mv /home/player/VCSNative /home/player/ports/gtavcs-psp/`
 (MTP never overwrites, hence send-then-move).
 
 ## Patches
@@ -78,7 +78,7 @@ then over the console `mv /home/player/VCSNative /home/player/ports/vcs/`
 | Patch | What |
 |---|---|
 | 0001 | build: `PSPRECOMP_VCS_GE_BACKEND=GLES2` on Linux (EGL, GLES 2, SDL2, threads), with `platform/linux/` |
-| 0002 | the GLES 2 GE backend, from `glOSports-lcsrecomp` (its 0005, plus the backend parts of its 0009 strips kept as strips, 0010 off-screen draws dropped, 0018 NEON cull scan, 0025 raw vertex path (hardware-transform layouts go to the GPU as the PSP stores them; the vertex shader decodes, skins with up to 8 bones, lights with the PSP's model and generates UVs, from a 64-vec4 uniform block per state change), 0026 the merge loop on the transform thread (keys instead of GL objects, `glDrawArrays` for sequential groups), 0031 merged strips as sequential runs and constant attributes once per frame, 0037 shader variants warmed before the first frame (texture pool and upload thread opt-in, off), 0038 the driver's program binaries cached in `config/shader-cache/`) on VCS's backend interface (`ge_gpu_backend.hpp`: the raw layout and uniform block, no-zero-fill index buffers). VCS's pre-transform pass on the transform thread skips raw batches (their first vertex is a byte offset). The texture key is two 32-bit lanes, and a prim whose texture fields equal the previous one's reuses its key (~1,000 keys a frame in a cutscene). The frame shown is the target with the most geometry (sticky until another has 1.5×), as VCS's Vulkan backend does: VCS draws scene and HUD into a working buffer (0x88000) and copies it into the displayed one on the next vblank, and a vblank that draws only that small copy is not shown (it alternated with the scene: a jumping flicker). The backend presents directly only while the GE draws (movies and loading screens, which the game writes to memory, come through `present_rgba`). A target's size is the largest clip rectangle drawn into it that frame, at least 480×272: VCS composes gameplay into 512×320 and shows all of it, but lays out menus and loading screens in 480×272 and squeezes the loading art from its 512×320 working buffer into a 480×272 one (a size kept across frames showed those with black bands, and the two buffers the pause menu alternates between at two scales: flicker; a size per draw zoomed the frame whenever the help box showed). A target read as a texture is addressed by its own logical size (the loading-screen copy reads the 512×320 buffer as a 512×512 texture, and the logo was left out); only direct-colour textures count as a target read back (a palette texture loaded where a target used to be, the weapon icon after loading a save, showed a miniature of the screen). Clear-mode draws write only the channels the clear selects (colour, alpha, depth), as on the PSP: a depth-only clear painted its vertex colour, the green flash when skipping the credits. 4:3 HUD factor. `VCS_GLES_VSYNC=0` swaps without waiting for the blank; `VCS_GLES_TARGET_LOG=1` logs each vblank's targets and vertex counts. |
+| 0002 | the GLES 2 GE backend, from `glOSports-gtalcs-psp` (its 0005, plus the backend parts of its 0009 strips kept as strips, 0010 off-screen draws dropped, 0018 NEON cull scan, 0025 raw vertex path (hardware-transform layouts go to the GPU as the PSP stores them; the vertex shader decodes, skins with up to 8 bones, lights with the PSP's model and generates UVs, from a 64-vec4 uniform block per state change), 0026 the merge loop on the transform thread (keys instead of GL objects, `glDrawArrays` for sequential groups), 0031 merged strips as sequential runs and constant attributes once per frame, 0037 shader variants warmed before the first frame (texture pool and upload thread opt-in, off), 0038 the driver's program binaries cached in `config/shader-cache/`) on VCS's backend interface (`ge_gpu_backend.hpp`: the raw layout and uniform block, no-zero-fill index buffers). VCS's pre-transform pass on the transform thread skips raw batches (their first vertex is a byte offset). The texture key is two 32-bit lanes, and a prim whose texture fields equal the previous one's reuses its key (~1,000 keys a frame in a cutscene). The frame shown is the target with the most geometry (sticky until another has 1.5×), as VCS's Vulkan backend does: VCS draws scene and HUD into a working buffer (0x88000) and copies it into the displayed one on the next vblank, and a vblank that draws only that small copy is not shown (it alternated with the scene: a jumping flicker). The backend presents directly only while the GE draws (movies and loading screens, which the game writes to memory, come through `present_rgba`). A target's size is the largest clip rectangle drawn into it that frame, at least 480×272: VCS composes gameplay into 512×320 and shows all of it, but lays out menus and loading screens in 480×272 and squeezes the loading art from its 512×320 working buffer into a 480×272 one (a size kept across frames showed those with black bands, and the two buffers the pause menu alternates between at two scales: flicker; a size per draw zoomed the frame whenever the help box showed). A target read as a texture is addressed by its own logical size (the loading-screen copy reads the 512×320 buffer as a 512×512 texture, and the logo was left out); only direct-colour textures count as a target read back (a palette texture loaded where a target used to be, the weapon icon after loading a save, showed a miniature of the screen). Clear-mode draws write only the channels the clear selects (colour, alpha, depth), as on the PSP: a depth-only clear painted its vertex colour, the green flash when skipping the credits. 4:3 HUD factor. `VCS_GLES_VSYNC=0` swaps without waiting for the blank; `VCS_GLES_TARGET_LOG=1` logs each vblank's targets and vertex counts. |
 | 0003 | `platform/linux/display_window_sdl.cpp`: no window; SDL game controller with a radial dead zone (`VCS_STICK_SCALE`, `VCS_STICK_DEADZONE`, as LCS); frames the GE didn't draw go to the backend, converted by rows straight from guest memory and only when they changed (the generic decoder took 8.5 ms a vblank, every vblank, during movies); SIGTERM (Start+Select: `appctl stop-application`), which SDL turns into a quit event, ends the game. SDL audio (upstream's macOS audio) on Linux. |
 | 0004 | 32-bit ARM: `vfmaq_n_f32` (AArch64 only) as `vmlaq_n_f32` in the renderer's NEON transforms. |
 | 0005 | no CPU rasterizer under GLES 2 (the backend draws every target and serves framebuffer feedback from its GPU copy; upstream only skipped the displayed buffer, so the whole scene in the working buffer was rasterized on the CPU as well); hardware transform allowed for GLES 2 (upstream keeps it off for its Vulkan backend); the HUD and its clip rectangle squeezed vertically for a view narrower than 16:9 (as LCS 0008; the clip keeps the radar map inside its circle), towards the top or bottom by the centre of what the clip lets through (radar tiles are rotated quads far larger than the radar; by their whole extent some were squeezed towards the top, a strip of the map above the circle at some camera angles); palette checksums cached while the palette's pages are unwritten (LCS 0011/0024; VCS already hashed words as LCS 0012), and texture signatures the same way (1,024 entries); the raw vertex path (LCS 0025, `PSPRECOMP_GE_GPU_RAW`, on): a hardware-transform draw with a layout the shader decodes sends the PSP's vertex bytes and a uniform block (matrices, bones, lights, material, UV generation), sent again only when the block changes; alpha and fog control worked out once per draw instead of per vertex; the cloud camera observer (for VCS's Vulkan sky) compiled out under GLES 2 |
