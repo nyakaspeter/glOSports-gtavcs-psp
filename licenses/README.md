@@ -124,4 +124,6 @@ declares (the files list every licence that applies, and refer to Debian's
 | `libzvbi0t64` 0.2.44-1 | `libzvbi.so.0` | GPL-2+ | `libzvbi0t64.copyright.txt` |
 | `ocl-icd-libopencl1` 2.3.3-1 | `libOpenCL.so.1` | BSD-2-Clause | `ocl-icd-libopencl1.copyright.txt` |
 
+The port's own code is MIT (`LICENSE.txt`, the repo's `LICENSE`).
+
 The game itself is not included in `gtavcs-psp.zip`: its files come from your own copy.

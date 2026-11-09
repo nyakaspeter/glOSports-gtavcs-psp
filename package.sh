@@ -52,6 +52,7 @@ cp "$GLOS"/glos-gpu "$GLOS"/glos-gpu-switch "$GLOS"/mali.ko "$GLOS"/glos_fbfix.k
 # glOSports-gtalcs-psp (tools/src/fbpan.c).
 cp glos/fbpan.so "$OUT/gtavcs-psp/glos/"
 rm -rf "$OUT/gtavcs-psp/licenses" && cp -R licenses "$OUT/gtavcs-psp/licenses"
+cp LICENSE "$OUT/gtavcs-psp/licenses/LICENSE.txt"
 mkdir -p "$OUT/gtavcs-psp/config" && cp config/VCSNative.ini "$OUT/gtavcs-psp/config/"
 # The driver's program binaries of the shader variants played so far: loaded
 # (and warmed) before the first frame, so a fresh install starts without the

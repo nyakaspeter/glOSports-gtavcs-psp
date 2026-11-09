@@ -185,3 +185,8 @@ the HUD shows (fbprobe on the money counter), ~265 PSP draws a frame.
   was not it.
 - Serial line: a bench killed on the Mac keeps running in the console's
   shell; send Ctrl-C over the serial port before the next command.
+
+## Licence
+
+The port's own code is MIT (`LICENSE`); `package.sh` puts a copy into the game folder's
+`licenses/`. Third-party components and their licences: `licenses/README.md`.
