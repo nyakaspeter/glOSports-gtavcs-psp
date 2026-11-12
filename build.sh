@@ -38,8 +38,17 @@ case "$PGO" in
     *) echo "PGO must be generate, use or off"; exit 2 ;;
 esac
 gen_opt=${GEN_OPT:-3}
+# IDENTITY=0 (default 1): without the PSP's memory mapped at its own addresses
+# (guest address = host address, see GuestMemory; the executable is then
+# linked at 0x10000000, clear of the scratchpad, VRAM and RAM).
+link=''
+if [ "${IDENTITY:-1}" = 1 ]; then flags="$flags -DPSPRECOMP_FASTMEM_IDENTITY"; link='-Wl,-Ttext-segment=0x10000000'; fi
+# LINES=1: line tables (-g1) so a sampled host PC resolves to a generated
+# line and its guest label (tools/guest-profile.py); the packaged binary is stripped.
+if [ "${LINES:-0}" = 1 ]; then flags="$flags -g1"; fi
+stamp="$PGO-O$gen_opt-I${IDENTITY:-1}-L${LINES:-0}"
 targets=${*:-VCSNative}
-echo "PGO=$PGO GEN_OPT=$gen_opt BUILD_DIR=$B PGO_DIR=$PGO_DIR"
+echo "PGO=$PGO GEN_OPT=$gen_opt IDENTITY=${IDENTITY:-1} LINES=${LINES:-0} BUILD_DIR=$B PGO_DIR=$PGO_DIR"
 docker buildx build --load -t vcs-recomp-builder . >/dev/null
 # One build per directory at a time: a build left running (e.g. after Ctrl-C) is stopped.
 name="vcs-recomp-build-$(basename "$PWD")-$B"
@@ -51,7 +60,7 @@ docker run --rm --name "$name" -v "$PWD":/w -w /w vcs-recomp-builder sh -c "
     # position-independent: PIE reserves a register for the GOT base in every
     # generated function.
     A33='-mcpu=cortex-a7 -mtune=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -ffp-contract=off -fno-pie'
-    [ -f $B/build.ninja ] && [ \"\$(cat $B/.config 2>/dev/null)\" = '$PGO-O$gen_opt' ] ||
+    [ -f $B/build.ninja ] && [ \"\$(cat $B/.config 2>/dev/null)\" = '$stamp' ] ||
         cmake -S upstream -B $B -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE=/w/toolchain-armhf.cmake \
             -DCMAKE_BUILD_TYPE=Release -DPSPRECOMP_PROFILE=vcs \
@@ -59,7 +68,7 @@ docker run --rm --name "$name" -v "$PWD":/w -w /w vcs-recomp-builder sh -c "
             -DPSPRECOMP_BUILD_TESTS=OFF -DPSPRECOMP_BUILD_PROFILE_TESTS=OFF \
             -DPSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH=ON -DPSPRECOMP_AOT_PRODUCTION_FASTPATHS=ON \
             -DPSPRECOMP_GENERATED_OPT_LEVEL=$gen_opt \
-            -DCMAKE_C_FLAGS=\"\$A33 $flags\" -DCMAKE_CXX_FLAGS=\"\$A33 $flags\" -DCMAKE_EXE_LINKER_FLAGS='-no-pie $flags'
-    echo '$PGO-O$gen_opt' > $B/.config
+            -DCMAKE_C_FLAGS=\"\$A33 $flags\" -DCMAKE_CXX_FLAGS=\"\$A33 $flags\" -DCMAKE_EXE_LINKER_FLAGS='-no-pie $link $flags'
+    echo '$stamp' > $B/.config
     ninja -C $B -j${JOBS:-8} $targets"
 [ "$targets" = VCSNative ] && file "$B"/bin/Release/VCSNative 2>/dev/null || true

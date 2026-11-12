@@ -1,0 +1,3 @@
+# PCs inside functions that stay in their unit (the generator's --leaf-exclude):
+# upstream's hand-made hooks (tools/unit-hooks.patch) edit them there.
+0x08B64020  # the function at 0x08B63FAC crosses from unit 0215 into 0216, where its hook is applied

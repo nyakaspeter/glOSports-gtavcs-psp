@@ -1,0 +1,1173 @@
+diff --git a/profiles/vcs/tools/vcs_codegen_main.cpp b/profiles/vcs/tools/vcs_codegen_main.cpp
+index 604f355..077fd8a 100644
+--- a/profiles/vcs/tools/vcs_codegen_main.cpp
++++ b/profiles/vcs/tools/vcs_codegen_main.cpp
+@@ -10,6 +10,7 @@
+ #include <cctype>
+ #include <charconv>
+ #include <chrono>
++#include <cstdlib>
+ #include <filesystem>
+ #include <cmath>
+ #include <limits>
+@@ -993,10 +994,337 @@ std::string call_function_chain_expression(std::uint32_t unit, std::uint32_t tar
+         std::to_string(unit) + "u, 0u, " + psprecomp::hex32(target) + "u>(ctx, &aot_mem_ref)";
+ }
+ 
++// --cache-gpr: inside a leaf or call function every guest register the
++// function names lives in a local `std::uint32_t r<n>` instead of
++// ctx.gpr[n].  Guest stores go through the window's uint8_t pointer, which
++// may alias AllegrexContext, so GCC reloads ctx.gpr[] after every one of
++// them; it cannot do that to a local whose address never escapes.  Two
++// forward dataflows over the function's blocks place the context traffic:
++//   load  `r<n> = ctx.gpr[n]` where r<n> is read and not valid yet (valid:
++//         loaded or written on every path since the function was entered,
++//         a continuation resumed or a chained call returned), and on a goto
++//         whose target expects more valid registers than the edge has;
++//   store `ctx.gpr[n] = r<n>` of every register written since then (dirty)
++//         before each chained call, each return and each host call that
++//         reads the context: rt.unsupported, rt.arithmetic_overflow, and
++//         ctx.execute_signed_add/_sub, which read and write ctx.gpr by index
++//         themselves (their destination is reloaded after them).
++// A goto stores what is dirty on its edge but not at its target and loads
++// what its target expects valid and the edge lacks, so any choice of the
++// blocks' incoming sets is correct; they are chosen for speed (see
++// finalize_gpr_cache): mostly intersections, so no value is kept alive just
++// to be stored or used on another path, and at loop headers what every back
++// edge has, so a loop keeps its values in locals across iterations.
++// An unwound call returns without storing: the context is then the only
++// copy of the guest state.  Dirty is a subset of valid everywhere, so a load
++// never overwrites a pending value and a store never writes an unloaded
++// local.  $zero stays the literal 0u; ctx.pc and jump_target are unchanged.
++std::string lower_constant_gpr_writes(std::string text);
++
++std::uint32_t gpr_read_mask(const std::string &text) {
++    constexpr std::string_view needle = "ctx.gpr[";
++    std::uint32_t mask = 0u;
++    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1u)) {
++        const std::size_t begin = at + needle.size();
++        std::size_t cursor = begin;
++        while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) ++cursor;
++        if (cursor == begin || cursor >= text.size() || text[cursor] != ']')
++            throw psprecomp::Error("--cache-gpr: non-constant gpr index in " + text);
++        const auto index = static_cast<std::uint32_t>(std::stoul(text.substr(begin, cursor - begin)));
++        if (index == 0u || index >= 32u) throw psprecomp::Error("--cache-gpr: gpr index in " + text);
++        mask |= 1u << index;
++    }
++    return mask;
++}
++
++std::uint32_t gpr_write_mask(const std::string &text) {
++    constexpr std::string_view needle = "ctx.set_gpr(";
++    std::uint32_t mask = 0u;
++    for (std::size_t at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1u)) {
++        const std::size_t begin = at + needle.size();
++        std::size_t cursor = begin;
++        while (cursor < text.size() && std::isdigit(static_cast<unsigned char>(text[cursor]))) ++cursor;
++        if (cursor == begin) throw psprecomp::Error("--cache-gpr: non-constant set_gpr in " + text);
++        const auto index = static_cast<std::uint32_t>(std::stoul(text.substr(begin, cursor - begin)));
++        if (index >= 32u) throw psprecomp::Error("--cache-gpr: set_gpr index in " + text);
++        if (index != 0u) mask |= 1u << index;
++    }
++    return mask;
++}
++
++struct GprCache {
++    // A point in a block: its sets are the block's incoming sets plus these.
++    struct Point { std::uint32_t block; std::uint32_t dirty; std::uint32_t valid; std::uint32_t mask; };
++    // An edge into block `to`; from_block false: function entry, a
++    // continuation or a call's return (nothing dirty, nothing valid).  For
++    // the dominators a call's return comes from the calling block (`from`),
++    // the function entry from the root, and an entry-id case not at all;
++    // Call (dominators only): a call through the dispatcher (an import) to
++    // its continuation, which is entered by a case.
++    enum class Kind : std::uint8_t { Block, Entry, Case, Return, Call };
++    struct Edge { std::uint32_t from; std::uint32_t to; bool from_block; std::uint32_t dirty; std::uint32_t valid; Kind kind; };
++    struct State { std::uint32_t dirty; std::uint32_t valid; };
++    std::vector<Point> loads;    // mask: registers read here
++    std::vector<Point> stores;
++    std::vector<Edge> edges;
++    std::vector<std::uint32_t> reloads;  // a single register reloaded (after add/sub)
++    std::uint32_t block{};
++    std::uint32_t dirty{};
++    std::uint32_t valid{};
++    std::uint32_t noted{};       // every register noted as written
++
++    void begin_block(std::uint32_t label) { block = label; dirty = 0u; valid = 0u; }
++    [[nodiscard]] State save() const { return {dirty, valid}; }
++    void restore(State state) { dirty = state.dirty; valid = state.valid; }
++    void write(std::uint32_t mask) { dirty |= mask; valid |= mask; noted |= mask; }
++    // Loads of the registers `mask` that are not valid here.
++    std::string read(std::uint32_t mask) {
++        if (mask == 0u) return {};
++        loads.push_back({block, dirty, valid, mask});
++        valid |= mask;
++        return "@@GL_" + std::to_string(loads.size() - 1u) + "@@";
++    }
++    std::string read_line(std::uint32_t mask) {
++        std::string token = read(mask);
++        return token.empty() ? token : "    " + token + "\n";
++    }
++    // Stores of the dirty registers (the state is unchanged: a store sits on
++    // one path, before a call or a return).
++    std::string store(const std::string &indent) {
++        stores.push_back({block, dirty, valid, 0u});
++        return indent + "@@GS_" + std::to_string(stores.size() - 1u) + "@@\n";
++    }
++    // Inline, in front of a `goto L_<to>`.
++    std::string edge(std::uint32_t to) {
++        edges.push_back({block, to, true, dirty, valid, Kind::Block});
++        return "@@GE_" + std::to_string(edges.size() - 1u) + "@@";
++    }
++    std::string entry_edge(std::uint32_t to, Kind kind = Kind::Entry) {
++        edges.push_back({block, to, false, 0u, 0u, kind});
++        return "@@GE_" + std::to_string(edges.size() - 1u) + "@@";
++    }
++    // After a chained call that came back to its continuation `to`.
++    std::string resume(std::uint32_t to) {
++        return "{ " + entry_edge(to, Kind::Return) + "goto L_" + psprecomp::hex32(to).substr(2) + "; }";
++    }
++    void call_edge(std::uint32_t to) { edges.push_back({block, to, false, 0u, 0u, Kind::Call}); }
++    // An entry-id case of a call function (resumption after an unwind).
++    std::string entry_case(std::uint32_t to) {
++        return "{ " + entry_edge(to, Kind::Case) + "goto L_" + psprecomp::hex32(to).substr(2) + "; }";
++    }
++    // One emitted guest instruction.
++    std::string instruction(std::string text) {
++        const std::uint32_t reads = gpr_read_mask(text);
++        const std::uint32_t writes = gpr_write_mask(text);
++        if (text.find("ctx.execute_signed_") != std::string::npos) {
++            // add/sub: reads and writes ctx.gpr by index; store before, reload rd after.
++            static const std::regex form(R"(ctx\.execute_signed_(?:add|sub)\(([0-9]+)u, [0-9]+u, [0-9]+u\))");
++            std::smatch match;
++            if (reads != 0u || writes != 0u || !std::regex_search(text, match, form))
++                throw psprecomp::Error("--cache-gpr: unexpected add/sub form " + text);
++            const auto destination = static_cast<std::uint32_t>(std::stoul(match[1].str()));
++            std::string out = store("    ") + text;
++            if (destination != 0u && destination < 32u) {
++                reloads.push_back(destination);
++                out += "    @@GR_" + std::to_string(reloads.size() - 1u) + "@@\n";
++                valid |= 1u << destination;
++            }
++            return out;
++        }
++        if (text.find("return;") != std::string::npos) {
++            // rt.unsupported(...); return; -- the context must be current.
++            if (reads != 0u || writes != 0u)
++                throw psprecomp::Error("--cache-gpr: register access before a return in " + text);
++            return store("    ") + text;
++        }
++        // A conditional write (movz/movn) keeps the old value on the other
++        // path, so its destination must be valid before it.
++        const bool conditional = text.find("if (") != std::string::npos;
++        std::string out = read_line(reads | (conditional ? writes : 0u)) + text;
++        write(writes);
++        return out;
++    }
++};
++
++// Resolves the loads and stores, renames ctx.gpr[n] to r<n>, declares the
++// locals.
++std::string finalize_gpr_cache(std::string text, const GprCache &cache, const std::string &name) {
++    text = lower_constant_gpr_writes(std::move(text));
++    if (text.find("ctx.set_gpr(") != std::string::npos)
++        throw psprecomp::Error("--cache-gpr: set_gpr left in " + name);
++    static const std::regex reference(R"(ctx\.gpr\[([0-9]+)\])");
++    static const std::regex assignment(R"(ctx\.gpr\[([0-9]+)\] = )");
++    const std::uint32_t used = gpr_read_mask(text);
++    std::uint32_t written = 0u;
++    for (std::sregex_iterator it(text.begin(), text.end(), assignment), end; it != end; ++it)
++        written |= 1u << static_cast<std::uint32_t>(std::stoul((*it)[1].str()));
++    if ((written & ~cache.noted) != 0u)
++        throw psprecomp::Error("--cache-gpr: register write the dataflow did not see in " + name);
++    text = std::regex_replace(text, reference, "r$1");
++    if (text.find("gpr") != std::string::npos)
++        throw psprecomp::Error("--cache-gpr: other context register access in " + name);
++
++    // Back edges: edges whose target dominates their source (dominators over
++    // the blocks of the ordinary flow: from a virtual root to the function
++    // entry, gotos, and calls to their continuations).
++    std::vector<std::uint32_t> blocks;
++    for (const auto &edge : cache.edges) {
++        blocks.push_back(edge.to);
++        if (edge.kind != GprCache::Kind::Entry && edge.kind != GprCache::Kind::Case)
++            blocks.push_back(edge.from);
++    }
++    std::sort(blocks.begin(), blocks.end());
++    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
++    const std::size_t count = blocks.size() + 1u;  // [0] is the root
++    const auto node = [&](std::uint32_t block) {
++        return static_cast<std::size_t>(std::lower_bound(blocks.begin(), blocks.end(), block) - blocks.begin()) + 1u;
++    };
++    std::vector<std::vector<std::size_t>> predecessors(count);
++    for (const auto &edge : cache.edges) {
++        if (edge.kind == GprCache::Kind::Case) continue;
++        predecessors[node(edge.to)].push_back(edge.kind == GprCache::Kind::Entry ? 0u : node(edge.from));
++    }
++    const std::size_t words = (count + 63u) / 64u;
++    std::vector<std::vector<std::uint64_t>> dominators(count, std::vector<std::uint64_t>(words, ~0ull));
++    dominators[0].assign(words, 0ull);
++    dominators[0][0] = 1ull;
++    for (bool changed = true; changed;) {
++        changed = false;
++        for (std::size_t n = 1u; n < count; ++n) {
++            std::vector<std::uint64_t> value(words, predecessors[n].empty() ? 0ull : ~0ull);
++            for (const auto p : predecessors[n])
++                for (std::size_t w = 0u; w < words; ++w) value[w] &= dominators[p][w];
++            value[n / 64u] |= 1ull << (n % 64u);
++            if (value != dominators[n]) { dominators[n] = std::move(value); changed = true; }
++        }
++    }
++    const auto back_edge = [&](const GprCache::Edge &edge) {
++        if (!edge.from_block) return false;
++        const std::size_t to = node(edge.to);
++        return ((dominators[node(edge.from)][to / 64u] >> (to % 64u)) & 1ull) != 0ull;
++    };
++
++    // dirty_in: what is dirty on every incoming edge, plus, at a loop
++    // header, what is dirty on every back edge (written in every iteration:
++    // stored once after the loop, not in each iteration); the least solution
++    // (a value dirty before a loop and untouched in it is stored on the
++    // entry edge).  valid_in: what is valid on every incoming edge, plus
++    // dirty_in, plus at a loop header what every back edge has when the
++    // header has only that (loaded or written in every iteration: loaded on
++    // the entry edges once instead of in each iteration); the greatest
++    // solution (a value valid before a loop and untouched in it stays valid
++    // in it), the headers' additions fixed between the two passes.
++    std::map<std::uint32_t, std::uint32_t> dirty_in, valid_in, hoisted;
++    const auto in = [](const std::map<std::uint32_t, std::uint32_t> &sets, std::uint32_t block) {
++        const auto found = sets.find(block);
++        return found != sets.end() ? found->second : 0u;
++    };
++    // Returns, per block, the intersection over its back edges (all ones:
++    // none).
++    const auto solve = [&](std::map<std::uint32_t, std::uint32_t> &sets, std::uint32_t start, bool valid) {
++        for (const auto &edge : cache.edges)
++            if (edge.kind != GprCache::Kind::Call) sets[edge.to] = start;
++        std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> meet;  // all, back edges
++        for (bool changed = true; changed;) {
++            changed = false;
++            meet.clear();
++            for (const auto &edge : cache.edges) {
++                if (edge.kind == GprCache::Kind::Call) continue;
++                const std::uint32_t value = (edge.from_block ? in(sets, edge.from) : 0u) |
++                                            (valid ? edge.valid : edge.dirty);
++                auto [found, first] = meet.try_emplace(edge.to, value, 0xFFFFFFFFu);
++                if (!first) found->second.first &= value;
++                if (back_edge(edge)) found->second.second &= value;
++            }
++            for (auto &[block, set] : sets) {
++                const auto &[all, back] = meet[block];
++                std::uint32_t value = all;
++                if (valid) value |= in(dirty_in, block) | in(hoisted, block);
++                else if (back != 0xFFFFFFFFu) value |= back;
++                value &= used;
++                if (value != set) { set = value; changed = true; }
++            }
++        }
++        std::map<std::uint32_t, std::uint32_t> back_meet;
++        for (const auto &[block, sets_of_block] : meet)
++            if (sets_of_block.second != 0xFFFFFFFFu) back_meet[block] = sets_of_block.second;
++        return back_meet;
++    };
++    solve(dirty_in, 0u, false);
++    hoisted = solve(valid_in, used, true);
++    solve(valid_in, used, true);
++    const auto list = [](std::uint32_t mask, const char *format) {
++        std::string out;
++        for (std::uint32_t index = 1u; index < 32u; ++index) {
++            if ((mask & (1u << index)) == 0u) continue;
++            std::string item = format;
++            for (std::size_t at; (at = item.find('#')) != std::string::npos;)
++                item.replace(at, 1u, std::to_string(index));
++            out += item;
++        }
++        return out;
++    };
++    const auto load_list = [&](std::uint32_t mask) { return list(mask, "r# = ctx.gpr[#]; "); };
++
++    std::string out;
++    out.reserve(text.size() + 1024u);
++    std::size_t written_to = 0u;
++    for (std::size_t at = text.find("@@G"); at != std::string::npos; at = text.find("@@G", written_to)) {
++        const std::size_t close = text.find("@@", at + 3u);
++        const std::string token = text.substr(at + 2u, close - at - 2u);  // e.g. "GL_12" or "GD"
++        std::string replacement;
++        if (token == "GD") {
++            if (used != 0u) {
++                const std::string names = list(used, "r#, ");
++                replacement = "std::uint32_t " + names.substr(0, names.size() - 2u) + ";";
++            }
++        } else {
++            const auto index = static_cast<std::size_t>(std::stoul(token.substr(3)));
++            if (token.starts_with("GL_")) {
++                const auto &point = cache.loads.at(index);
++                replacement = load_list(point.mask & ~(in(valid_in, point.block) | point.valid));
++            } else if (token.starts_with("GS_")) {
++                const auto &point = cache.stores.at(index);
++                replacement = list((in(dirty_in, point.block) | point.dirty) & used, "ctx.gpr[#] = r#; ");
++            } else if (token.starts_with("GE_")) {
++                const auto &edge = cache.edges.at(index);
++                const std::uint32_t dirty = (edge.from_block ? in(dirty_in, edge.from) : 0u) | edge.dirty;
++                const std::uint32_t have = (edge.from_block ? in(valid_in, edge.from) : 0u) | edge.valid;
++                replacement = list(dirty & ~in(dirty_in, edge.to) & used, "ctx.gpr[#] = r#; ") +
++                              load_list(in(valid_in, edge.to) & ~have & used);
++            } else if (token.starts_with("GR_")) {
++                replacement = load_list(1u << cache.reloads.at(index));
++            } else {
++                throw psprecomp::Error("--cache-gpr: bad token in " + name);
++            }
++        }
++        // A token alone on its line takes the line with it when it is empty.
++        const std::size_t line_start = text.rfind('\n', at) + 1u;
++        const bool alone = text.find_first_not_of(' ', line_start) == at &&
++                           close + 2u < text.size() && text[close + 2u] == '\n';
++        if (alone) {
++            out.append(text, written_to, line_start - written_to);
++            if (!replacement.empty()) {
++                while (replacement.back() == ' ') replacement.pop_back();
++                out.append(text, line_start, at - line_start);
++                out += replacement + "\n";
++            }
++            written_to = close + 3u;
++        } else {
++            out.append(text, written_to, at - written_to);
++            out += replacement;
++            written_to = close + 2u;
++        }
++    }
++    out.append(text, written_to, std::string::npos);
++    return out;
++}
++
+ // Units that exist (set by generate_auto): a fixed edge into an address no
+ // unit covers (data, or code past the generated range) goes through the
+ // dispatcher instead of naming a recomp_unit_N that was never emitted.
+ const std::set<std::uint32_t> *g_valid_units = nullptr;
++bool g_direct_tail_calls = false;  // --indirect-functions
+ bool unit_exists(std::uint32_t unit) {
+     return g_valid_units == nullptr || g_valid_units->contains(unit);
+ }
+@@ -1006,11 +1334,16 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
+                  std::uint32_t executable_base = 0u,
+                  std::uint32_t unit_span_bytes = 0u,
+                  const std::map<std::uint32_t, std::uint16_t> *direct_entry_ids = nullptr,
+-                 const std::set<std::uint32_t> *import_stubs = nullptr) {
++                 const std::set<std::uint32_t> *import_stubs = nullptr,
++                 GprCache *cache = nullptr,
++                 const std::map<std::uint32_t, std::string> *leaf_entries = nullptr,
++                 const std::map<std::uint32_t, std::string> *call_entries = nullptr) {
+     if (labels.contains(target)) {
+-        body << indent << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
++        body << indent << (cache != nullptr ? cache->edge(target) : std::string{}) << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
+         return;
+     }
++    // Every other exit leaves the function: the context must be current.
++    if (cache != nullptr) body << cache->store(indent);
+ 
+     // A fixed J/JAL to a PSP import must return to the outer dispatcher.
+     // Trying the generated-unit chain first is guaranteed to fail because import
+@@ -1030,6 +1363,14 @@ void emit_target(std::ostringstream &body, std::uint32_t target,
+     if (unit_span_bytes != 0u && target >= executable_base &&
+         unit_exists((target - executable_base) / unit_span_bytes)) {
+         const std::uint32_t unit = (target - executable_base) / unit_span_bytes;
++        // --indirect-functions: a jump to a leaf or call function (a tail
++        // call) calls it directly, as a `jal` to it does, instead of entering
++        // its unit, whose entry switch would forward to it.
++        if (g_direct_tail_calls && leaf_entries != nullptr && leaf_entries->contains(target))
++            body << indent << "(void)" << leaf_chain_expression(unit, target, direct_entry_ids) << "; return;\n";
++        else if (g_direct_tail_calls && call_entries != nullptr && call_entries->contains(target))
++            body << indent << "(void)" << call_function_chain_expression(unit, target) << "; return;\n";
++        else
+         body << indent << "(void)" << direct_unit_chain_expression(unit, target, direct_entry_ids)
+              << "; return;\n";
+     } else {
+@@ -1070,6 +1411,11 @@ struct GeneratedFunctionInput {
+     const std::map<std::uint32_t, std::string> *call_forwards{};
+     bool call_function{};
+     const std::vector<std::uint32_t> *continuations{};
++    // --indirect-functions: the other entry points of merged functions, with
++    // the function's name and the entry's id: a `jal` to one calls it there.
++    const std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> *call_aliases{};
++    // --cache-gpr (leaf and call functions only): guest registers in locals.
++    bool cache_gpr{};
+ };
+ 
+ // True when every `vpfx` in the program is consumed by a VFPU instruction in
+@@ -1105,10 +1451,35 @@ bool prefixes_fold_safely(const psprecomp::GuestMemory &memory,
+     return true;
+ }
+ 
++// --cache-gpr: the hand-made LZ copy loop (0x08B64AD8) writes registers and
++// jumps to labels in its own text, which the register dataflow does not see;
++// the function that holds it keeps its registers in the context.
++// So do the functions that upstream's hand-made hooks edit after generation
++// (the 4:3 projection, camera and aim, the pool-allocator assertion, the
++// audio and movie hooks): their text names ctx.gpr, and the hooks are applied
++// to the generated units as a patch.
++bool has_hand_made_blocks(const GeneratedFunctionInput &function, const psprecomp::GuestMemory &) {
++    static const std::set<std::uint32_t> hooked{
++        0x08934A24u, 0x08934B9Cu, 0x08937A28u, 0x08975D4Cu, 0x08985A1Cu, 0x0898D140u,
++        0x0898D2D8u, 0x0898DE2Cu, 0x0898DF58u, 0x0898E080u, 0x0898E188u, 0x0899DFE4u,
++        0x08B61028u, 0x08B6159Cu, 0x08B6B650u, 0x0893671Cu};
++    return function.instructions.contains(0x08B64AD8u) || hooked.contains(function.address);
++}
++
+ std::string emit_function_source(const GeneratedFunctionInput &function,
+                                  const psprecomp::GuestMemory &memory,
+                                  const std::string &cpp_name) {
+     std::ostringstream body;
++    GprCache gpr_cache;
++    GprCache *gc = function.cache_gpr && (function.leaf || function.call_function) &&
++                   !has_hand_made_blocks(function, memory) ? &gpr_cache : nullptr;
++    const auto instruction = [&](std::string text) { return gc != nullptr ? gc->instruction(std::move(text)) : text; };
++    const auto store = [&](const char *indent) { return gc != nullptr ? gc->store(indent) : std::string{}; };
++    const auto resume_goto = [&](std::uint32_t to) {
++        return gc != nullptr ? gc->resume(to) : "goto L_" + psprecomp::hex32(to).substr(2) + ";";
++    };
++    const auto edge = [&](std::uint32_t to) { return gc != nullptr ? gc->edge(to) : std::string{}; };
++    const auto read = [&](const std::string &text) { return gc != nullptr ? gc->read_line(gpr_read_mask(text)) : std::string{}; };
+ 
+     // Unit entry dispatch.  A `switch (ctx.pc)` over several hundred sparse
+     // guest addresses compiles to a branch tree, and every outer dispatch pays
+@@ -1156,6 +1527,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                 "    GuestMemory::AotFastView aot_mem = aot_mem_ref;\n"
+                 "    std::uint32_t jump_target = 0u;\n"
+                 "    (void)rt; (void)aot_mem; (void)jump_target;\n";
++        if (gc != nullptr) body << "    @@GD@@\n";
+     } else if (function.call_function) {
+         // A call function: id 0 falls into the entry block (first below); a
+         // continuation id is the resumption after an unwind out of one of its
+@@ -1166,12 +1538,16 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                 "    // the window cannot alias it and its pointers stay in registers.\n"
+                 "    GuestMemory::AotFastView aot_mem = aot_mem_ref;\n"
+                 "    std::uint32_t jump_target = 0u;\n"
+-                "    (void)rt; (void)aot_mem; (void)jump_target;\n"
+-                "    if (entry_id != 0u) [[unlikely]] {\n"
++                "    (void)rt; (void)aot_mem; (void)jump_target;\n";
++        if (gc != nullptr) body << "    @@GD@@\n";
++        body << "    if (entry_id != 0u) [[unlikely]] {\n"
+                 "        switch (entry_id) {\n";
+         std::uint32_t id = 1u;
+-        for (const auto label : *function.continuations)
+-            body << "        case " << id++ << "u: goto L_" << psprecomp::hex32(label).substr(2) << ";\n";
++        for (const auto label : *function.continuations) {
++            body << "        case " << id++ << "u: ";
++            if (gc != nullptr) body << gc->entry_case(label) << "\n";
++            else body << "goto L_" << psprecomp::hex32(label).substr(2) << ";\n";
++        }
+         body << "        default: rt.unsupported(ctx.pc, 0u, \"invalid function entry\"); return;\n"
+                 "        }\n"
+                 "    }\n";
+@@ -1253,14 +1629,16 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+         if (single_function && block_start == function.address) continue;
+         block_order.push_back(block_start);
+     }
++    if (gc != nullptr && !block_order.empty()) body << "    " << gc->entry_edge(block_order.front()) << "\n";
+     for (const auto block_start : block_order) {
+         body << "L_" << psprecomp::hex32(block_start).substr(2) << ":\n";
++        if (gc != nullptr) gc->begin_block(block_start);
+         std::uint32_t pc = block_start;
+         PrefixState prefix;
+         prefix.enabled = function.fold_vfpu_prefixes;
+         while (function.instructions.contains(pc)) {
+             if (pc != block_start && function.entry_labels.contains(pc)) {
+-                body << "    goto L_" << psprecomp::hex32(pc).substr(2) << ";\n";
++                body << "    " << edge(pc) << "goto L_" << psprecomp::hex32(pc).substr(2) << ";\n";
+                 break;
+             }
+ 
+@@ -1294,7 +1672,8 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+             // steep ped-vs-building contacts that agree with downward motion;
+             // wall contacts and upward ceiling impacts remain untouched.
+             if (pc == 0x08931438u) {
+-                body << "    if (ctx.gpr[2] != 0u &&\n"
++                body << read("ctx.gpr[2] ctx.gpr[16] ctx.gpr[17] ctx.gpr[18]")
++                     << "    if (ctx.gpr[2] != 0u &&\n"
+                      << "        (rt.memory().aot_load32(ctx.gpr[16] + 72u) & 14u) == 6u &&\n"
+                      << "        (rt.memory().aot_load32(ctx.gpr[18] + 72u) & 14u) == 2u) {\n"
+                      << "        const float ped_vz = std::bit_cast<float>(rt.memory().aot_load32(ctx.gpr[16] + 328u));\n"
+@@ -1318,7 +1697,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+             if (decoded.has_delay_slot()) {
+                 const auto slot = psprecomp::decode_allegrex(memory.load32(pc + 4u));
+                 if (slot.is_control_flow()) {
+-                    body << "    rt.unsupported(" << psprecomp::hex32(pc + 4u) << "u, "
++                    body << store("    ") << "    rt.unsupported(" << psprecomp::hex32(pc + 4u) << "u, "
+                          << psprecomp::hex32(slot.word)
+                          << "u, \"control flow in delay slot\"); return;\n";
+                     break;
+@@ -1330,22 +1709,27 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                     const std::uint32_t fallthrough = pc + 8u;
+                     const bool likely_branch = is_likely_branch(decoded.kind);
+                     const std::string condition = branch_condition(decoded);
++                    body << read(condition);
+                     if (is_link_branch(decoded.kind)) {
+                         body << "    ctx.set_gpr(31, " << psprecomp::hex32(pc + 8u) << "u);\n";
++                        if (gc != nullptr) gc->write(1u << 31u);
+                     }
+                     if (likely_branch) {
++                        // The slot runs on the taken path only.
++                        const GprCache::State not_taken = gc != nullptr ? gc->save() : GprCache::State{};
+                         body << "    if (" << condition << ") {\n"
+-                             << emit_regular(slot, pc + 4u, prefix);
+-                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
++                             << instruction(emit_regular(slot, pc + 4u, prefix));
++                        emit_target(body, target, function.entry_labels, "        ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, gc, function.leaf_entries, function.call_entries);
+                         body << "    }\n";
+-                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
++                        if (gc != nullptr) gc->restore(not_taken);
++                        emit_target(body, fallthrough, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, gc, function.leaf_entries, function.call_entries);
+                     } else {
+                         body << "    { const bool branch_taken = " << condition << ";\n"
+-                             << emit_regular(slot, pc + 4u, prefix)
++                             << instruction(emit_regular(slot, pc + 4u, prefix))
+                              << "      if (branch_taken) {\n";
+-                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
++                        emit_target(body, target, function.entry_labels, "          ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, gc, function.leaf_entries, function.call_entries);
+                         body << "      }\n";
+-                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
++                        emit_target(body, fallthrough, function.entry_labels, "      ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, gc, function.leaf_entries, function.call_entries);
+                         body << "    }\n";
+                     }
+                 } else if (decoded.kind == psprecomp::OpcodeKind::J ||
+@@ -1353,25 +1737,28 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                     const std::uint32_t target = ((pc + 4u) & 0xF0000000u) | (decoded.target << 2u);
+                     if (decoded.kind == psprecomp::OpcodeKind::Jal) {
+                         body << "    ctx.set_gpr(31, " << psprecomp::hex32(pc + 8u) << "u);\n";
++                        if (gc != nullptr) gc->write(1u << 31u);
+                     }
+-                    body << emit_regular(slot, pc + 4u, prefix);
++                    body << instruction(emit_regular(slot, pc + 4u, prefix));
+                     if (decoded.kind == psprecomp::OpcodeKind::J) {
+-                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs);
++                        emit_target(body, target, function.entry_labels, "    ", function.executable_base, function.unit_span_bytes, function.direct_entry_ids, function.import_stubs, gc, function.leaf_entries, function.call_entries);
+                     } else if (target == 0x08B648B0u) {
+                         // Keep the VCS raw-DEFLATE entry visible to Runtime so
+                         // install_profile can select the verified host decoder.
+                         // With PSPRECOMP_NO_FAST_DEFLATE the same dispatch lands
+                         // in the original generated guest implementation.
++                        body << store("    ");
++                        if (gc != nullptr && function.entry_labels.contains(pc + 8u)) gc->call_edge(pc + 8u);
+                         body << "    ctx.pc = 0x08B648B0u;\n"
+                              << "    return;\n";
+                     } else if (target == 0x088B1554u) {
+                         const std::uint32_t return_pc = pc + 8u;
+-                        body << "    ctx.pc = 0x088B1554u;\n"
++                        body << store("    ") << "    ctx.pc = 0x088B1554u;\n"
+                              << "    rt.invoke_native_fast_path(0x088B1554u, ctx);\n"
+ ;
+                         if (function.entry_labels.contains(return_pc)) {
+                             body << "    if (ctx.pc == " << psprecomp::hex32(return_pc)
+-                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n"
++                                 << "u) " << resume_goto(return_pc) << "\n"
+                                  << "    return;\n";
+                         } else {
+                             body << "    return;\n";
+@@ -1385,9 +1772,10 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         const std::uint32_t return_pc = pc + 8u;
+                         const std::uint32_t target_unit = (target - function.executable_base) / function.unit_span_bytes;
+                         const std::string call = leaf_chain_expression(target_unit, target, function.direct_entry_ids);
++                        body << store("    ");
+                         if (function.entry_labels.contains(return_pc)) {
+                             body << "    if (" << call << " && ctx.pc == " << psprecomp::hex32(return_pc)
+-                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
++                                 << "u) " << resume_goto(return_pc) << "\n";
+                         } else {
+                             body << "    (void)" << call << ";\n";
+                         }
+@@ -1400,9 +1788,29 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         const std::uint32_t return_pc = pc + 8u;
+                         const std::uint32_t target_unit = (target - function.executable_base) / function.unit_span_bytes;
+                         const std::string call = call_function_chain_expression(target_unit, target);
++                        body << store("    ");
++                        if (function.entry_labels.contains(return_pc)) {
++                            body << "    if (" << call << " && ctx.pc == " << psprecomp::hex32(return_pc)
++                                 << "u) " << resume_goto(return_pc) << "\n";
++                        } else {
++                            body << "    (void)" << call << ";\n";
++                        }
++                        body << "    return;\n";
++                    } else if (function.call_aliases != nullptr && function.call_aliases->contains(target) &&
++                               !function.entry_labels.contains(target) &&
++                               function.unit_span_bytes != 0u && target >= function.executable_base) {
++                        // JAL to another entry point of a merged function: the
++                        // same direct call, at that entry's id.
++                        const std::uint32_t return_pc = pc + 8u;
++                        const std::uint32_t target_unit = (target - function.executable_base) / function.unit_span_bytes;
++                        const auto &alias = function.call_aliases->at(target);
++                        const std::string call = "rt.invoke_chained_direct<&" + alias.first + ", " +
++                            std::to_string(target_unit) + "u, " + std::to_string(alias.second) + "u, " +
++                            psprecomp::hex32(target) + "u>(ctx, &aot_mem_ref)";
++                        body << store("    ");
+                         if (function.entry_labels.contains(return_pc)) {
+                             body << "    if (" << call << " && ctx.pc == " << psprecomp::hex32(return_pc)
+-                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
++                                 << "u) " << resume_goto(return_pc) << "\n";
+                         } else {
+                             body << "    (void)" << call << ";\n";
+                         }
+@@ -1412,15 +1820,15 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         // label. Going through ctx.pc + LOCAL_DISPATCH needlessly
+                         // re-decodes a dense entry id and burns the local-transfer
+                         // counter. The delay slot and $ra write have already run.
+-                        body << "    goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
++                        body << "    " << edge(target) << "goto L_" << psprecomp::hex32(target).substr(2) << ";\n";
+                     } else if (target == 0x088B1780u) {
+                         const std::uint32_t return_pc = pc + 8u;
+-                        body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
++                        body << store("    ") << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
+                              << "    rt.invoke_native_fast_path(0x088B1780u, ctx);\n"
+ ;
+                         if (function.entry_labels.contains(return_pc)) {
+                             body << "    if (ctx.pc == " << psprecomp::hex32(return_pc)
+-                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n"
++                                 << "u) " << resume_goto(return_pc) << "\n"
+                                  << "    return;\n";
+                         } else {
+                             body << "    return;\n";
+@@ -1432,7 +1840,9 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         const std::uint32_t return_pc = pc + 8u;
+                         const bool target_is_import = function.import_stubs != nullptr &&
+                             function.import_stubs->contains(target);
++                        body << store("    ");
+                         if (target_is_import) {
++                            if (gc != nullptr && function.entry_labels.contains(return_pc)) gc->call_edge(return_pc);
+                             body << "    ctx.pc = " << psprecomp::hex32(target) << "u;\n"
+                                  << "    return;\n";
+                             break;  // the block ends at this return (a continue here never advanced pc)
+@@ -1453,7 +1863,7 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                             else
+                                 body << "rt.invoke_chained_call(ctx, &aot_mem_ref)";
+                             body << " && ctx.pc == " << psprecomp::hex32(return_pc)
+-                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n";
++                                 << "u) " << resume_goto(return_pc) << "\n";
+                         } else {
+                             if (direct_unit)
+                                 body << "    (void)" << direct_unit_chain_expression(target_unit, target, function.direct_entry_ids) << ";\n";
+@@ -1464,19 +1874,20 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                     }
+                 } else {
+                     const std::uint32_t link = decoded.rd == 0u ? 31u : decoded.rd;
+-                    body << "    jump_target = " << reg(decoded.rs) << ";\n";
++                    body << read(reg(decoded.rs)) << "    jump_target = " << reg(decoded.rs) << ";\n";
+                     if (decoded.kind == psprecomp::OpcodeKind::Jalr) {
+                         body << "    ctx.set_gpr(" << link << ", " << psprecomp::hex32(pc + 8u) << "u);\n";
++                        if (gc != nullptr && link != 0u) gc->write(1u << link);
+                     }
+-                    body << emit_regular(slot, pc + 4u, prefix);
++                    body << instruction(emit_regular(slot, pc + 4u, prefix));
+                     if (decoded.kind == psprecomp::OpcodeKind::Jalr && pc == 0x0886269Cu) {
+                         const std::uint32_t return_pc = pc + 8u;
+-                        body << "    ctx.pc = jump_target;\n"
++                        body << store("    ") << "    ctx.pc = jump_target;\n"
+                              << "    rt.invoke_native_fast_path(0x088B1780u, ctx);\n"
+ ;
+                         if (function.entry_labels.contains(return_pc)) {
+                             body << "    if (ctx.pc == " << psprecomp::hex32(return_pc)
+-                                 << "u) goto L_" << psprecomp::hex32(return_pc).substr(2) << ";\n"
++                                 << "u) " << resume_goto(return_pc) << "\n"
+                                  << "    return;\n";
+                         } else {
+                             body << "    return;\n";
+@@ -1486,21 +1897,33 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+                         // The runtime rejects import wrappers, so a JALR into
+                         // the kernel still leaves through the dispatcher.
+                         const std::uint32_t return_pc = pc + 8u;
+-                        body << "    ctx.pc = jump_target;\n";
++                        body << store("    ") << "    ctx.pc = jump_target;\n";
+                         if (function.entry_labels.contains(return_pc)) {
+                             body << "    if (rt.invoke_chained_call(ctx, &aot_mem_ref) && ctx.pc == "
+-                                 << psprecomp::hex32(return_pc) << "u) goto L_"
+-                                 << psprecomp::hex32(return_pc).substr(2) << ";\n";
++                                 << psprecomp::hex32(return_pc) << "u) " << resume_goto(return_pc) << "\n";
+                         } else {
+                             body << "    (void)rt.invoke_chained_call(ctx, &aot_mem_ref);\n";
+                         }
+                         body << "    return;\n";
++                    } else if ((function.leaf || function.call_function) && decoded.rs != 31u) {
++                        // A computed jump inside a function (--indirect-functions:
++                        // a jump table, or a tail call through a pointer): to
++                        // the block it names when that is one of the
++                        // function's own, otherwise out through ctx.pc like a
++                        // return.
++                        body << "    switch (jump_target) {\n";
++                        for (const auto label : function.entry_labels)
++                            body << "    case " << psprecomp::hex32(label) << "u: { " << edge(label) << "goto L_"
++                                 << psprecomp::hex32(label).substr(2) << "; }\n";
++                        body << "    default: break;\n    }\n"
++                             << store("    ") << "    ctx.pc = jump_target;\n"
++                             << "    return;\n";
+                     } else if (function.leaf || function.call_function) {
+                         // `jr $ra` of a leaf or call function: the caller (a
+                         // direct call, a unit's forwarding entry or the
+                         // dispatcher) reads ctx.pc, exactly as after a unit's
+                         // return.  (Selection admits no other `jr` there.)
+-                        body << "    ctx.pc = jump_target;\n"
++                        body << store("    ") << "    ctx.pc = jump_target;\n"
+                              << "    return;\n";
+                     } else {
+                         // Plain JR, including `jr $ra`.  A return that lands in
+@@ -1518,26 +1941,31 @@ std::string emit_function_source(const GeneratedFunctionInput &function,
+             if (decoded.kind == psprecomp::OpcodeKind::Syscall ||
+                 decoded.kind == psprecomp::OpcodeKind::Vfpu ||
+                 decoded.kind == psprecomp::OpcodeKind::Unsupported) {
+-                body << "    rt.unsupported(" << psprecomp::hex32(pc) << "u, "
++                body << store("    ") << "    rt.unsupported(" << psprecomp::hex32(pc) << "u, "
+                      << psprecomp::hex32(decoded.word) << "u, \""
+                      << cpp_escape(decoded.mnemonic) << " not lowered yet\"); return;\n";
+                 break;
+             }
+ 
+-            body << emit_regular(decoded, pc, prefix);
++            body << instruction(emit_regular(decoded, pc, prefix));
+             const std::uint32_t next = pc + 4u;
+             if (!function.instructions.contains(next)) {
+-                body << "    ctx.pc = " << psprecomp::hex32(next) << "u; return;\n";
++                body << store("    ") << "    ctx.pc = " << psprecomp::hex32(next) << "u; return;\n";
+                 break;
+             }
+             if (function.entry_labels.contains(next)) {
+-                body << "    goto L_" << psprecomp::hex32(next).substr(2) << ";\n";
++                body << "    " << edge(next) << "goto L_" << psprecomp::hex32(next).substr(2) << ";\n";
+                 break;
+             }
+             pc = next;
+         }
+     }
+     body << "}\n\n";
++    if (gc != nullptr) {
++        std::string cached = finalize_gpr_cache(body.str(), gpr_cache, cpp_name);
++        body.str("");
++        body << cached;
++    }
+     if (function.leaf) {
+         // The per-PC dispatcher entry of the leaf (outer loop, exact-PC chain
+         // fallback of a poisoned unit, invoke_isolated_aot).
+@@ -1960,6 +2388,7 @@ struct FunctionRegion {
+     std::set<std::uint32_t> entry_labels;   // its blocks, as the unit had them
+     bool calls{};                           // a call function, not a leaf
+     std::vector<std::uint32_t> continuations;  // call PC + 8, ascending
++    std::set<std::uint32_t> extra_entries;  // the other entry points of a merged function
+ };
+ 
+ struct RegionSelection {
+@@ -1997,7 +2426,8 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+                                         const std::set<std::uint32_t> &valid_units,
+                                         std::uint32_t executable_base,
+                                         std::uint32_t unit_span_bytes,
+-                                        bool allow_calls) {
++                                        bool allow_calls,
++                                        bool indirect_targets) {
+     using K = psprecomp::OpcodeKind;
+     RegionSelection selection;
+     const auto &ranges = program.executable_ranges;
+@@ -2012,8 +2442,6 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+     // counts per target, and every j/branch edge in the program by target.
+     std::unordered_map<std::uint32_t, std::uint32_t> owner_count;
+     owner_count.reserve(program.covered_labels.size() * 2u);
+-    for (const auto &function : program.functions)
+-        for (const auto label : function.labels) ++owner_count[label];
+     std::unordered_map<std::uint32_t, std::size_t> jal_sites_by_target;
+     std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> jump_sources_by_target;
+     for (const auto pc : program.covered_labels) {
+@@ -2023,24 +2451,180 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+         else if (is_branch(d.kind)) jump_sources_by_target[branch_target(pc, d)].push_back(pc);
+     }
+ 
++    // The instructions of each candidate. The analysis follows a `j` or a
++    // branch into the function it names, so a function that ends in a tail
++    // call owned its callee's instructions as well and both counted as
++    // sharing them. --indirect-functions: a candidate's own instructions are
++    // those reachable from its entry without entering another function some
++    // `jal` names; the jump into that function is then an exit (emit_target
++    // makes it a chained call and returns: a tail call).
++    const auto named = [&](std::uint32_t pc) {
++        const auto found = jal_sites_by_target.find(pc);
++        return found != jal_sites_by_target.end() && found->second != 0u;
++    };
++    std::vector<std::set<std::uint32_t>> own(program.functions.size());
++    for (std::size_t index = 0u; index < program.functions.size(); ++index) {
++        const auto &function = program.functions[index];
++        if (!indirect_targets) { own[index] = function.labels; continue; }
++        std::vector<std::uint32_t> work{function.entry};
++        std::set<std::uint32_t> &seen = own[index];
++        while (!work.empty()) {
++            const std::uint32_t pc = work.back();
++            work.pop_back();
++            if (!function.labels.contains(pc) || !seen.insert(pc).second) continue;
++            const auto d = psprecomp::decode_allegrex(memory.load32(pc));
++            const auto push = [&](std::uint32_t next) {
++                if (next != function.entry && named(next)) return;
++                work.push_back(next);
++            };
++            if (d.has_delay_slot()) {
++                if (is_branch(d.kind)) { push(branch_target(pc, d)); push(pc + 8u); }
++                else if (d.kind == K::J) push(jump_target(pc, d));
++                else if (d.kind == K::Jal || d.kind == K::Jalr) push(pc + 8u);
++            } else if (!d.is_control_flow()) {
++                push(pc + 4u);
++            }
++        }
++    }
++    for (const auto &labels : own)
++        for (const auto label : labels) ++owner_count[label];
++    const auto own_of = [&](const psprecomp::FunctionAnalysis &function) -> const std::set<std::uint32_t> & {
++        return own[static_cast<std::size_t>(&function - program.functions.data())];
++    };
++
++    // --indirect-functions: a candidate no `jal` names whose instructions all
++    // belong to one larger candidate is a label inside that function (a jump
++    // table case, a block the analysis seeded), not a function of its own:
++    // it is dropped, so the function around it no longer counts as sharing
++    // instructions and can be converted; the label stays one of its entries
++    // (a continuation).
++    std::set<std::uint32_t> nested;
++    if (indirect_targets) {
++        std::unordered_map<std::uint32_t, std::vector<const psprecomp::FunctionAnalysis *>> owners;
++        for (const auto &function : program.functions)
++            for (const auto label : own_of(function)) owners[label].push_back(&function);
++        for (const auto &function : program.functions) {
++            const auto &labels = own_of(function);
++            if (labels.empty() || named(function.entry)) continue;
++            for (const auto *other : owners[function.entry]) {
++                const auto &outer = own_of(*other);
++                if (other == &function || outer.size() <= labels.size()) continue;
++                if (std::includes(outer.begin(), outer.end(), labels.begin(), labels.end())) {
++                    nested.insert(function.entry);
++                    break;
++                }
++            }
++        }
++        for (const auto &function : program.functions)
++            if (nested.contains(function.entry))
++                for (const auto label : own_of(function)) --owner_count[label];
++    }
++
++    // --indirect-functions: candidates that share instructions (a routine
++    // with a second entry point, routines with a common tail) become one
++    // function: the union of their instructions, entered at the lowest entry
++    // (id 0) or at one of the others, which are continuations of it like any
++    // inner entry (a `jal` to one calls the function at that id). Groups of
++    // more than 8 candidates or 6,000 instructions are left alone (what the
++    // analysis made of data).
++    std::vector<std::set<std::uint32_t>> extra_entries(program.functions.size());
++    std::vector<char> merged_away(program.functions.size(), 0);
++    if (indirect_targets) {
++        const std::size_t count = program.functions.size();
++        std::vector<std::size_t> parent(count);
++        for (std::size_t index = 0u; index < count; ++index) parent[index] = index;
++        const auto root = [&](std::size_t index) {
++            while (parent[index] != index) index = parent[index] = parent[parent[index]];
++            return index;
++        };
++        std::unordered_map<std::uint32_t, std::size_t> first_owner;
++        for (std::size_t index = 0u; index < count; ++index) {
++            const auto &function = program.functions[index];
++            if (function.labels.empty() || nested.contains(function.entry)) continue;
++            for (const auto label : own[index]) {
++                const auto [found, fresh] = first_owner.try_emplace(label, index);
++                if (!fresh) parent[root(index)] = root(found->second);
++            }
++        }
++        std::map<std::size_t, std::vector<std::size_t>> groups;
++        for (std::size_t index = 0u; index < count; ++index) {
++            const auto &function = program.functions[index];
++            if (function.labels.empty() || nested.contains(function.entry)) continue;
++            groups[root(index)].push_back(index);
++        }
++        for (const auto &[group_root, members] : groups) {
++            if (members.size() < 2u || members.size() > 8u) continue;
++            std::set<std::uint32_t> all;
++            std::size_t primary = members.front();
++            bool usable = true;
++            for (const auto member : members) {
++                all.insert(own[member].begin(), own[member].end());
++                if (program.functions[member].truncated) usable = false;
++                if (program.functions[member].entry < program.functions[primary].entry) primary = member;
++            }
++            if (!usable || all.size() > 6000u) continue;
++            for (const auto member : members) {
++                if (member == primary) continue;
++                merged_away[member] = 1;
++                extra_entries[primary].insert(program.functions[member].entry);
++            }
++            own[primary] = std::move(all);
++            for (const auto label : own[primary]) owner_count[label] = 1u;
++        }
++    }
++
+     for (const auto &function : program.functions) {
+         if (function.labels.empty()) continue;
++        const std::set<std::uint32_t> &labels = own_of(function);
++        const std::size_t candidate_index = static_cast<std::size_t>(&function - program.functions.data());
++        const std::set<std::uint32_t> &extra = extra_entries[candidate_index];
++        // A jump out of the function into one a `jal` names: a tail call.
++        const auto tail_call = [&](std::uint32_t target) {
++            return indirect_targets && target != function.entry && named(target);
++        };
+         ++selection.candidates;
+-        const auto exclude = [&](const char *reason) { ++selection.excluded[reason]; };
++        const auto exclude = [&](const char *reason) {
++            ++selection.excluded[reason];
++            // PSPRECOMP_SELECTION_LOG=1: every candidate left in its unit, with its size and the reason.
++            static const bool log = std::getenv("PSPRECOMP_SELECTION_LOG") != nullptr;
++            if (log) std::cerr << "[selection] " << psprecomp::hex32(function.entry) << " " << labels.size()
++                               << " instructions: " << reason << "\n";
++        };
+         if (function.truncated) { exclude("truncated"); continue; }
+-        if (jal_sites_by_target[function.entry] == 0u) { exclude("not a jal target"); continue; }
++        if (merged_away[candidate_index]) { exclude("an entry of a merged function"); continue; }
++        {
++            bool entries_ok = true;
++            for (const auto entry : extra) if (!global_entries.contains(entry)) entries_ok = false;
++            if (!entries_ok) { exclude("entry not a unit entry"); continue; }
++        }
++        if (nested.contains(function.entry)) { exclude("a label inside another function"); continue; }
++        // A region no `jal` names (a virtual method, a callback) gains no
++        // direct call, but inside a function its registers live in locals
++        // (--cache-gpr): --indirect-functions converts those too. It is
++        // entered through the dispatcher's per-PC entry, as its unit was.
++        if (!indirect_targets && jal_sites_by_target[function.entry] == 0u) { exclude("not a jal target"); continue; }
+         if (!global_entries.contains(function.entry)) { exclude("entry not a unit entry"); continue; }
+         bool shared = false;
+-        for (const auto label : function.labels) if (owner_count[label] > 1u) { shared = true; break; }
++        for (const auto label : labels) if (owner_count[label] > 1u) { shared = true; break; }
+         if (shared) { exclude("shares instructions with another function"); continue; }
+-        const std::uint32_t first = *function.labels.begin();
+-        const std::uint32_t last = *function.labels.rbegin();
++        const std::uint32_t first = *labels.begin();
++        const std::uint32_t last = *labels.rbegin();
+         const std::uint32_t unit = (function.entry - executable_base) / unit_span_bytes;
+-        if (first < executable_base || (first - executable_base) / unit_span_bytes != unit ||
+-            (last + 4u - executable_base) / unit_span_bytes != unit) { exclude("straddles a unit boundary"); continue; }
++        // A function that crosses into the next unit(s): --indirect-functions
++        // emits it with the unit of its entry; its continuations in the other
++        // units keep their entry ids there and those units forward them.
++        const bool straddles = first < executable_base || (first - executable_base) / unit_span_bytes != unit ||
++                               (last + 4u - executable_base) / unit_span_bytes != unit;
++        if (straddles && (!indirect_targets || first < function.entry)) { exclude("straddles a unit boundary"); continue; }
+         if (!valid_units.contains(unit)) { exclude("unit not emitted"); continue; }
++        if (straddles) {
++            bool all_valid = true;
++            for (std::uint32_t other = unit; other <= (last - executable_base) / unit_span_bytes; ++other)
++                if (!valid_units.contains(other)) { all_valid = false; break; }
++            if (!all_valid) { exclude("unit not emitted"); continue; }
++        }
+         bool has_import = false, has_excluded = false;
+-        for (const auto label : function.labels) {
++        for (const auto label : labels) {
+             if (import_stubs.contains(label) || import_stubs.contains(label + 4u)) has_import = true;
+             if (excluded_pcs.contains(label) || excluded_pcs.contains(label + 4u)) has_excluded = true;
+         }
+@@ -2049,7 +2633,7 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+ 
+         const char *reason = nullptr;
+         std::vector<std::uint32_t> continuations;
+-        for (const auto pc : function.labels) {
++        for (const auto pc : labels) {
+             const auto d = psprecomp::decode_allegrex(memory.load32(pc));
+             psprecomp::DecodedInstruction slot{};
+             const bool delay = d.has_delay_slot();
+@@ -2059,7 +2643,7 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+                 if (is_link_branch(d.kind)) { reason = "link branch"; break; }
+                 if (d.kind == K::Jal) {
+                     const std::uint32_t target = jump_target(pc, d);
+-                    if (target != function.entry && function.labels.contains(target)) {
++                    if (target != function.entry && labels.contains(target)) {
+                         reason = "jal into its own body"; break;
+                     }
+                 }
+@@ -2067,7 +2651,7 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+                 // function after an unwind out of the call: it must be one of
+                 // its blocks and keep a unit entry id to be forwarded with.
+                 const std::uint32_t continuation = pc + 8u;
+-                if (!function.labels.contains(continuation) || !global_entries.contains(continuation)) {
++                if (!labels.contains(continuation) || !global_entries.contains(continuation)) {
+                     reason = "continuation not a unit entry of the function"; break;
+                 }
+                 continuations.push_back(continuation);
+@@ -2077,22 +2661,27 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+                 reason = "unsupported instruction"; break;
+             }
+             if (delay && slot.is_control_flow()) { reason = "control flow in delay slot"; break; }
+-            if (d.kind == K::Jr && d.rs != 31u) { reason = "computed jr"; break; }
+-            if (writes_ra_oddly(d) || (delay && writes_ra_oddly(slot))) { reason = "writes $ra"; break; }
++            if (!indirect_targets && d.kind == K::Jr && d.rs != 31u) { reason = "computed jr"; break; }
++            // A function that keeps $ra somewhere else than its stack frame (the
++            // world-geometry clip loop at 0x08A09B2C parks it in a VFPU register):
++            // its `jr $ra` stores ctx.pc and returns like any other, and a caller
++            // that sees another pc than its return address unwinds to the
++            // dispatcher, so --indirect-functions converts these too.
++            if (!indirect_targets && (writes_ra_oddly(d) || (delay && writes_ra_oddly(slot)))) { reason = "writes $ra"; break; }
+             if (d.kind == K::J) {
+-                if (!function.labels.contains(jump_target(pc, d))) { reason = "j leaves the function"; break; }
++                if (!labels.contains(jump_target(pc, d)) && !tail_call(jump_target(pc, d))) { reason = "j leaves the function"; break; }
+             } else if (is_branch(d.kind)) {
+                 const std::uint32_t taken = branch_target(pc, d);
+                 const std::uint32_t fallthrough = pc + 8u;
+-                if ((psprecomp::is_executable_address(ranges, taken) && !function.labels.contains(taken)) ||
+-                    (psprecomp::is_executable_address(ranges, fallthrough) && !function.labels.contains(fallthrough))) {
++                if ((psprecomp::is_executable_address(ranges, taken) && !labels.contains(taken) && !tail_call(taken)) ||
++                    (psprecomp::is_executable_address(ranges, fallthrough) && !labels.contains(fallthrough) && !tail_call(fallthrough))) {
+                     reason = "branch leaves the function"; break;
+                 }
+             } else if (!delay && !d.is_control_flow()) {
+                 // Linear flow must stay inside the function (a seed right after
+                 // a non-returning path would otherwise be fallen into).
+                 const std::uint32_t next = pc + 4u;
+-                if (psprecomp::is_executable_address(ranges, next) && !function.labels.contains(next)) {
++                if (psprecomp::is_executable_address(ranges, next) && !labels.contains(next)) {
+                     reason = "falls out of the function"; break;
+                 }
+             }
+@@ -2100,19 +2689,21 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+         }
+         if (reason != nullptr) { exclude(reason); continue; }
+         bool entered_from_outside = false;
+-        for (const auto label : function.labels) {
++        for (const auto label : labels) {
++            // (--indirect-functions: another function may jump to the entry, its tail call.)
++            if (indirect_targets && (label == function.entry || extra.contains(label))) continue;
+             const auto sources = jump_sources_by_target.find(label);
+             if (sources == jump_sources_by_target.end()) continue;
+             for (const auto source : sources->second)
+-                if (!function.labels.contains(source)) { entered_from_outside = true; break; }
++                if (!labels.contains(source)) { entered_from_outside = true; break; }
+             if (entered_from_outside) break;
+         }
+         if (entered_from_outside) { exclude("j/branch target from outside"); continue; }
+         if (allow_calls) {
+             // A jal anywhere to a label of the body other than the entry.
+             bool jal_into_body = false;
+-            for (const auto label : function.labels)
+-                if (label != function.entry && jal_sites_by_target.contains(label) &&
++            for (const auto label : labels)
++                if (label != function.entry && !extra.contains(label) && jal_sites_by_target.contains(label) &&
+                     jal_sites_by_target.at(label) != 0u) { jal_into_body = true; break; }
+             if (jal_into_body) { exclude("jal target inside the body"); continue; }
+         }
+@@ -2120,8 +2711,8 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+         FunctionRegion region;
+         region.entry = function.entry;
+         region.unit = unit;
+-        region.instructions = function.labels;
+-        for (const auto label : function.labels)
++        region.instructions = labels;
++        for (const auto label : labels)
+             if (global_entries.contains(label)) region.entry_labels.insert(label);
+         // VCS: the dispatcher also re-enters functions at inner blocks it has
+         // registered (upstream registers every block entry), e.g. after a
+@@ -2139,6 +2730,7 @@ RegionSelection select_function_regions(const psprecomp::ProgramAnalysis &progra
+         }
+         region.calls = !continuations.empty();
+         region.continuations = std::move(continuations);
++        region.extra_entries = extra;
+         (region.calls ? selection.call_jal_sites : selection.jal_sites) += jal_sites_by_target[function.entry];
+         selection.regions.push_back(std::move(region));
+     }
+@@ -2165,7 +2757,9 @@ int generate_auto(const std::filesystem::path &elf_path,
+                   std::uint32_t unit_span_bytes,
+                   bool leaf_functions,
+                   bool call_functions,
+-                  const std::set<std::uint32_t> &leaf_excluded_pcs) {
++                  const std::set<std::uint32_t> &leaf_excluded_pcs,
++                  bool cache_gpr,
++                  bool indirect_functions) {
+     const auto elf = psprecomp::Elf32Image::from_file(elf_path);
+     psprecomp::GuestMemory memory;
+     (void)elf.load_and_relocate(memory, load_base);
+@@ -2250,11 +2844,13 @@ int generate_auto(const std::filesystem::path &elf_path,
+     std::set<std::uint32_t> valid_unit_buckets;
+     for (const auto &unit : units) valid_unit_buckets.insert(unit.bucket);
+     g_valid_units = &valid_unit_buckets;
++    g_direct_tail_calls = indirect_functions;
+     RegionSelection region_selection;
+     std::map<std::uint32_t, std::string> leaf_entries;
+     std::map<std::uint32_t, std::string> call_entries;
+     std::map<std::uint32_t, std::string> call_forwards;
+     std::set<std::uint32_t> call_continuations;
++    std::map<std::uint32_t, std::pair<std::string, std::uint32_t>> call_aliases;  // a merged function's other entries
+     std::size_t leaf_instructions = 0u;
+     std::size_t call_instructions = 0u;
+     std::size_t leaves_dropped = 0u;
+@@ -2262,14 +2858,17 @@ int generate_auto(const std::filesystem::path &elf_path,
+     if (leaf_functions || call_functions) {
+         region_selection = select_function_regions(program, memory, import_stubs, leaf_excluded_pcs, global_entries,
+                                                    valid_unit_buckets, executable_base, unit_span_bytes,
+-                                                   call_functions);
++                                                   call_functions, indirect_functions);
+         std::map<std::uint32_t, Unit *> unit_by_bucket;
+         for (auto &unit : units) unit_by_bucket[unit.bucket] = &unit;
+         for (const auto &region : region_selection.regions) {
+             if (!region.calls && !leaf_functions) { ++leaves_dropped; continue; }
+             Unit &unit = *unit_by_bucket.at(region.unit);
+-            for (const auto pc : region.instructions) unit.instructions.erase(pc);
+-            for (const auto label : region.entry_labels) unit.code_entries.erase(label);
++            // (A function that straddles units takes its instructions out of each.)
++            for (const auto pc : region.instructions)
++                unit_by_bucket.at((pc - executable_base) / unit_span_bytes)->instructions.erase(pc);
++            for (const auto label : region.entry_labels)
++                unit_by_bucket.at((label - executable_base) / unit_span_bytes)->code_entries.erase(label);
+             unit.regions.push_back(&region);
+             if (!region.calls) {
+                 leaf_entries[region.entry] = leaf_cpp_name(region.entry);
+@@ -2281,6 +2880,7 @@ int generate_auto(const std::filesystem::path &elf_path,
+             call_forwards[region.entry] = name + "(rt, ctx, 0u, aot_mem_ref); return;";
+             std::uint32_t id = 1u;
+             for (const auto continuation : region.continuations) {
++                if (region.extra_entries.contains(continuation)) call_aliases[continuation] = {name, id};
+                 call_forwards[continuation] = name + "(rt, ctx, " + std::to_string(id++) + "u, aot_mem_ref); return;";
+                 call_continuations.insert(continuation);
+             }
+@@ -2337,6 +2937,9 @@ int generate_auto(const std::filesystem::path &elf_path,
+             false,
+             call_functions ? &call_entries : nullptr,
+             call_functions ? &call_forwards : nullptr,
++            false,
++            nullptr,
++            indirect_functions ? &call_aliases : nullptr,
+         };
+ 
+         std::ostringstream out;
+@@ -2377,6 +2980,8 @@ int generate_auto(const std::filesystem::path &elf_path,
+                         nullptr,
+                         region->calls,
+                         region->calls ? &region->continuations : nullptr,
++                        indirect_functions ? &call_aliases : nullptr,
++                        cache_gpr,
+                     };
+                     source += emit_function_source(single, memory, single.name);
+                 }
+@@ -2525,16 +3130,22 @@ int main(int argc, char **argv) {
+     try {
+         const char *auto_usage =
+             "Usage: psp_recomp <ELF> --auto <generated_dir> [load_base_hex] [unit_span_bytes]"
+-            " [--leaf-functions] [--call-functions] [--leaf-exclude <pc_list>]\n";
++            " [--leaf-functions] [--call-functions] [--leaf-exclude <pc_list>] [--cache-gpr] [--indirect-functions]\n";
+         if (argc >= 4 && std::string_view(argv[2]) == "--auto") {
+             std::vector<std::string_view> positional;
+             bool leaf_functions = false;
++            bool cache_gpr = false;
++            bool indirect_functions = false;
+             bool call_functions = false;
+             std::set<std::uint32_t> leaf_excluded_pcs;
+             for (int i = 4; i < argc; ++i) {
+                 const std::string_view argument(argv[i]);
+                 if (argument == "--leaf-functions") {
+                     leaf_functions = true;
++                } else if (argument == "--cache-gpr") {
++                    cache_gpr = true;
++                } else if (argument == "--indirect-functions") {
++                    indirect_functions = true;
+                 } else if (argument == "--call-functions") {
+                     call_functions = true;
+                 } else if (argument == "--leaf-exclude") {
+@@ -2559,7 +3170,7 @@ int main(int argc, char **argv) {
+                 : 0x20000u;
+             if (unit_span == 0u || (unit_span & 3u) != 0u) throw psprecomp::Error("unit_span_bytes must be non-zero and 4-byte aligned");
+             return generate_auto(argv[1], argv[3], load_base, unit_span, leaf_functions, call_functions,
+-                                 leaf_excluded_pcs);
++                                 leaf_excluded_pcs, cache_gpr, indirect_functions);
+         }
+         if (argc == 4) return generate_manual(argv[1], argv[2], argv[3]);
+         std::cerr << "Usage:\n"

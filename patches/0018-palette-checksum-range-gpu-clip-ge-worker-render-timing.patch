@@ -1,0 +1,444 @@
+diff --git a/profiles/vcs/host/ge_gpu_backend.hpp b/profiles/vcs/host/ge_gpu_backend.hpp
+index 6d29f38..943a179 100644
+--- a/profiles/vcs/host/ge_gpu_backend.hpp
++++ b/profiles/vcs/host/ge_gpu_backend.hpp
+@@ -692,6 +692,11 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept;
+ // Finishes one real VCS GPU preview frame at vblank, submits it once, waits for
+ // completion and stores an RGBA8 readback. Returns true when a new frame exists.
+ [[nodiscard]] bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept;
++#if defined(VCS_GLES2_GE_BACKEND)
++// Counts the frames finished (ge_gpu_backend_finish_color_frame); read by the
++// GE worker to spread its texture re-checks over frames.
++[[nodiscard]] std::uint32_t ge_gpu_backend_frame_counter() noexcept;
++#endif
+ 
+ [[nodiscard]] bool ge_gpu_backend_copy_game_frame_rgba(
+     std::span<std::byte> destination) noexcept;
+diff --git a/profiles/vcs/host/ge_gpu_backend_gles2.cpp b/profiles/vcs/host/ge_gpu_backend_gles2.cpp
+index 6411647..1a333ce 100644
+--- a/profiles/vcs/host/ge_gpu_backend_gles2.cpp
++++ b/profiles/vcs/host/ge_gpu_backend_gles2.cpp
+@@ -37,6 +37,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <ctime>
+ #include <chrono>
+ #include <cmath>
+ #include <condition_variable>
+@@ -429,6 +430,11 @@ struct RenderState {
+     std::uint64_t fps_index_bytes{};
+     // VCS_FPS_LOG: bytes per frame sent to the GPU (vertices, packed, indices, textures).
+     std::array<std::uint64_t, 4> fps_bytes{};
++    // The render thread's time per FPS interval: waiting for a frame, texture
++    // uploads, the frame's GL calls, the swap (VCS_FPS_LOG).
++    std::array<std::uint64_t, 4> fps_ns{};
++    std::uint64_t fps_upload_calls{};
++    std::uint64_t fps_cpu_ns{};  // the thread's CPU time inside its frames (the rest of their time: waits)
+     // VCS_FPS_LOG: textures adopted from the upload thread and uploaded here,
+     // and programs compiled, per interval.
+     std::uint64_t fps_thread_uploads{};
+@@ -1372,6 +1378,16 @@ void adopt_texture(RenderState &r, std::uint64_t key, const GlTexture &texture)
+ void upload_texture(RenderState &r, TextureUpload &upload) {
+     if (upload.width == 0u || upload.height == 0u || upload.rgba8.empty()) return;
+     ++r.fps_render_uploads;
++    ++r.fps_upload_calls;
++    // (timed for the FPS log's render thread line)
++    struct Timer {
++        std::uint64_t &total;
++        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
++        ~Timer() {
++            total += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                std::chrono::steady_clock::now() - start).count());
++        }
++    } timer{r.fps_ns[1]};
+     if (r.shared.pool_enabled) {
+         adopt_texture(r, upload.key, create_texture(r.shared, upload));
+         r.bound_texture = 0xFFFFFFFFu;
+@@ -2147,8 +2163,10 @@ void pace_present() {
+ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+     draw_fps(r);
+     pace_present();
++    const auto swap_start = std::chrono::steady_clock::now();
+     eglSwapBuffers(r.display, r.surface);
+     const auto now = std::chrono::steady_clock::now();
++    r.fps_ns[3] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - swap_start).count());
+     if (r.fps_frames == 0u && r.fps_start.time_since_epoch().count() == 0) r.fps_start = now;
+     ++r.fps_frames;
+     if (r.shown_start.time_since_epoch().count() == 0) r.shown_start = now;
+@@ -2170,6 +2188,13 @@ void swap(RenderState &r, std::uint64_t psp_draws, std::uint64_t gl_draws) {
+                      r.fps_bytes[0] / frames / 1024.0, r.fps_bytes[1] / frames / 1024.0,
+                      r.fps_bytes[2] / frames / 1024.0, r.fps_bytes[3] / frames / 1024.0);
+     r.fps_bytes = {};
++    if (r.log_fps)
++        std::fprintf(stderr, "glos: render thread ms/frame idle %.1f uploads %.1f (%.1f textures) draws %.1f swap %.1f cpu %.1f\n",
++                     r.fps_ns[0] / frames / 1e6, r.fps_ns[1] / frames / 1e6, r.fps_upload_calls / frames,
++                     r.fps_ns[2] / frames / 1e6, r.fps_ns[3] / frames / 1e6, r.fps_cpu_ns / frames / 1e6);
++    r.fps_ns = {};
++    r.fps_upload_calls = 0u;
++    r.fps_cpu_ns = 0u;
+     if (r.log_fps)
+         std::fprintf(stderr, "glos: texture uploads upload-thread %llu render-thread %llu  pool hits %llu allocations %llu  shader compiles %llu\n",
+                      static_cast<unsigned long long>(r.fps_thread_uploads),
+@@ -2629,6 +2654,7 @@ void render_thread_main(Gles2State *s) {
+         std::cerr << "[gles2] render thread: eglMakeCurrent failed 0x" << std::hex << eglGetError() << std::dec << '\n';
+     for (;;) {
+         std::unique_ptr<Frame> frame;
++        const auto idle_start = std::chrono::steady_clock::now();
+         {
+             std::unique_lock<std::mutex> lock(s->queue_mutex);
+             s->queue_cv.wait(lock, [&] { return s->stop || s->queued != nullptr; });
+@@ -2636,8 +2662,25 @@ void render_thread_main(Gles2State *s) {
+             frame = std::move(s->queued);
+         }
+         s->queue_cv.notify_all();  // the GE thread may queue the next frame
++        const auto frame_start = std::chrono::steady_clock::now();
++        const std::uint64_t before = r.fps_ns[1] + r.fps_ns[3];
++        const auto thread_cpu = [] {
++            timespec time{};
++            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &time);
++            return static_cast<std::uint64_t>(time.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(time.tv_nsec);
++        };
++        const std::uint64_t cpu_start = thread_cpu();
+         if (frame->guest) render_guest(r, *frame);
+         else render_frame(r, *frame);
++        r.fps_cpu_ns += thread_cpu() - cpu_start;
++        // (swap() may have printed and zeroed the counters: then this frame's
++        // share goes to the next interval, a frame in thirty.)
++        const auto frame_ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now() - frame_start).count());
++        const std::uint64_t inside = r.fps_ns[1] + r.fps_ns[3] >= before ? r.fps_ns[1] + r.fps_ns[3] - before : 0u;
++        r.fps_ns[0] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++            frame_start - idle_start).count());
++        r.fps_ns[2] += frame_ns > inside ? frame_ns - inside : 0u;
+         frame->clear();
+         std::lock_guard<std::mutex> lock(s->queue_mutex);
+         s->spare.push_back(std::move(frame));
+@@ -3052,6 +3095,11 @@ bool create_backend(Gles2State &s, std::string &error) {
+ 
+ }  // namespace
+ 
++namespace {
++std::atomic<std::uint32_t> g_frame_counter{0u};
++}
++std::uint32_t ge_gpu_backend_frame_counter() noexcept { return g_frame_counter.load(std::memory_order_relaxed); }
++
+ // ------------------------------------------------------------- public API --
+ // Everything below runs on the GE thread (or the window thread, for guest
+ // frames) and never touches GL.
+@@ -3104,6 +3152,18 @@ bool prepare_texture(Gles2State &s, const GeGpuDrawDescriptor &draw, std::uint32
+     if (height == 0u) height = draw.texture_height;
+     if (width == 0u || height == 0u || rgba.empty() || mips == 0u) return false;
+     const std::uint64_t key = texture_key(draw);
++    // VCS_GLES_UPLOAD_LOG=1: one line per decoded texture (which ones come
++    // again and again while nothing new is on screen).
++    static const bool upload_log = std::getenv("VCS_GLES_UPLOAD_LOG") != nullptr;
++    if (upload_log)
++        std::fprintf(stderr, "glos: upload frame %u key %016llx address %08x %ux%u format %u mips %u clut %08x sum %08x signature %016llx level mode %u offset %d selected %u max %u filter %u%u%u%u%s\n",
++                     g_frame_counter.load(std::memory_order_relaxed), static_cast<unsigned long long>(key),
++                     draw.texture_address, width, height, draw.texture_format, mips, draw.clut_address, draw.clut_checksum,
++                     static_cast<unsigned long long>(draw.texture_content_signature),
++                     draw.texture_level_mode, static_cast<int>(draw.texture_level_offset16), draw.texture_selected_level,
++                     draw.texture_max_level, draw.texture_min_linear ? 1u : 0u, draw.texture_mag_linear ? 1u : 0u,
++                     draw.texture_mipmap_enabled ? 1u : 0u, draw.texture_mipmap_linear ? 1u : 0u,
++                     s.textures.find(key) != s.textures.end() ? " (again)" : "");
+     TextureInfo &texture = s.textures[key];
+     s.texture_bytes -= std::min(s.texture_bytes, texture.bytes);
+     texture.descriptor = draw;
+@@ -3111,8 +3171,6 @@ bool prepare_texture(Gles2State &s, const GeGpuDrawDescriptor &draw, std::uint32
+     texture.signature_epoch = s.frame_epoch;
+     texture.last_used_epoch = s.frame_epoch;
+     s.texture_bytes += texture.bytes;
+-    s.last_texture_rgba.assign(rgba.begin(),
+-                               rgba.begin() + std::min(rgba.size(), static_cast<std::size_t>(width) * height * 4u));
+     SharedTextures &shared = s.render.shared;
+     if (s.use_upload_thread && !shared.failed.load(std::memory_order_relaxed)) {
+         // To the upload thread now; the frame carries the job, which the
+@@ -3834,6 +3892,7 @@ void ge_gpu_backend_set_display_framebuffer(std::uint32_t address) noexcept {
+ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+     Gles2State &s = state();
+     std::lock_guard<std::recursive_mutex> guard(s.mutex);
++    g_frame_counter.fetch_add(1u, std::memory_order_relaxed);
+     const bool publish = true;
+     if (!s.enabled || (s.batches.empty() && s.uploads.empty() && s.deletes.empty())) {
+         s.vertices.clear();
+@@ -3851,16 +3910,36 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+     // until another target has 1.5 times its vertices, so two targets of
+     // similar size do not alternate.
+     std::uint64_t psp_draws = 0u;
+-    std::unordered_map<std::uint32_t, std::uint64_t> geometry;
+-    for (const Batch &batch : s.batches) {
+-        psp_draws += batch.logical_draw_count;
+-        geometry[batch.draw.framebuffer_address & 0x001FFFF0u] += batch.vertex_count + batch.index_count;
++    // A handful of targets and runs of batches into the same one: a flat list
++    // (a hash map lookup per batch, 800 a frame on a street, was 2% of the
++    // game thread, which hands the frame over).
++    std::vector<std::pair<std::uint32_t, std::uint64_t>> geometry;
++    const auto geometry_of = [&](std::uint32_t address) -> std::uint64_t & {
++        for (auto &entry : geometry)
++            if (entry.first == address) return entry.second;
++        return geometry.emplace_back(address, 0u).second;
++    };
++    {
++        std::uint32_t run_address = ~0u;
++        std::uint64_t run_geometry = 0u;
++        for (const Batch &batch : s.batches) {
++            psp_draws += batch.logical_draw_count;
++            const std::uint32_t address = batch.draw.framebuffer_address & 0x001FFFF0u;
++            if (address != run_address) {
++                if (run_address != ~0u) geometry_of(run_address) += run_geometry;
++                run_address = address;
++                run_geometry = 0u;
++            }
++            run_geometry += batch.vertex_count + batch.index_count;
++        }
++        if (run_address != ~0u) geometry_of(run_address) += run_geometry;
+     }
+     std::uint32_t largest = 0u;
+     std::uint64_t largest_geometry = 0u;
+     for (const auto &[address, count] : geometry)
+         if (count > largest_geometry) { largest = address; largest_geometry = count; }
+-    const auto sticky = geometry.find(s.last_winner);
++    const auto sticky = std::find_if(geometry.begin(), geometry.end(),
++                                     [&](const auto &entry) { return entry.first == s.last_winner; });
+     std::uint32_t winner =
+         (sticky != geometry.end() && largest_geometry * 2u < sticky->second * 3u) ? s.last_winner : largest;
+     // A vblank that did not draw the last winner but only a small target
+@@ -3888,7 +3967,7 @@ bool ge_gpu_backend_finish_color_frame(std::uint64_t vblank) noexcept {
+     }
+     if (touched_display) {
+         s.last_winner = winner;
+-        s.last_winner_geometry = geometry[winner];
++        s.last_winner_geometry = geometry_of(winner);
+         s.small_frames = 0u;
+     }
+     std::unique_ptr<Frame> frame = take_frame(s);
+diff --git a/profiles/vcs/host/ge_renderer.cpp b/profiles/vcs/host/ge_renderer.cpp
+index 7d4429f..5acb325 100644
+--- a/profiles/vcs/host/ge_renderer.cpp
++++ b/profiles/vcs/host/ge_renderer.cpp
+@@ -2233,36 +2233,64 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
+         std::uint32_t base{}, size{}, width{}, height{};
+         std::uint64_t pages{}, hash{};
+     };
+-    static thread_local std::array<CachedSignature, 1024> signature_cache{};
+-    CachedSignature &cached = signature_cache[((texture.base >> 4u) ^ (texture.base >> 14u) ^ static_cast<std::uint32_t>(size)) & 1023u];
++    // 4,096 slots: a street draws some 300 textures, each level of a chain
++    // with a signature of its own, and in 1,024 slots they evicted each other
++    // and were hashed again every frame (9% of the GE worker's samples).
++    static thread_local std::array<CachedSignature, 4096> signature_cache{};
++    const std::uint32_t slot = (((texture.base >> 4u) * 0x9E3779B1u) >> 20u) & 4095u;
++    CachedSignature &cached = signature_cache[slot];
+     const std::uint64_t pages = memory.range_generation(texture.base, size);
+-    if (cached.hash != 0u && cached.base == texture.base && cached.size == size && cached.width == texture.width &&
+-        cached.height == texture.height && cached.pages == pages)
++    const bool same_texture = cached.hash != 0u && cached.base == texture.base && cached.size == size &&
++        cached.width == texture.width && cached.height == texture.height;
++    if (same_texture && cached.pages == pages) return cached.hash;
++#if defined(VCS_GLES2_GE_BACKEND)
++    // A texture whose pages were written (64 KB pages: the game's heap around
++    // it is written every frame) is hashed again only every fourth frame, each
++    // cache slot on its own frame of the four, as glOSports-gtalcs-psp does
++    // (its 0019): the hashes were a tenth of the GE worker's time. A texture
++    // replaced in place shows its old picture for at most three frames.
++    // VCS_GLES_TEXTURE_RECHECK=1: every frame.
++    static const bool recheck_every_frame = [] {
++        const char *text = std::getenv("VCS_GLES_TEXTURE_RECHECK");
++        return text != nullptr && *text != '\0' && *text != '0';
++    }();
++    if (same_texture && !recheck_every_frame && ((ge_gpu_backend_frame_counter() ^ slot) & 3u) != 0u)
+         return cached.hash;
++#endif
+ 
+     // Full hash for small dynamic surfaces; evenly distributed cache-line
+-    // samples for large world textures. Stage 40 mixed one byte at a time, so a
+-    // 1 KiB validation sample executed ~1,000 dependent multiply operations.
+-    // Fold eight bytes per iteration instead. The signature is process-local
+-    // cache validation, not a file format, so only collision quality matters.
+-    std::uint64_t hash = 0x9E3779B97F4A7C15ull;
+-    const auto mix64 = [&hash](std::uint64_t value) noexcept {
+-        hash ^= value + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+-        hash *= 0xD6E8FEB86659FD93ull;
+-        hash ^= hash >> 29u;
++    // samples for large world textures. Four 32-bit lanes, sixteen bytes a
++    // step (one NEON multiply): the 64-bit multiply-and-shift mix this
++    // replaces was about 25 instructions for eight bytes on 32-bit ARM. The
++    // signature is process-local cache validation, not a file format, so only
++    // collision quality matters.
++    std::uint32_t lanes[4] = {0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu};
++#if defined(__ARM_NEON)
++    uint32x4_t state = vld1q_u32(lanes);
++    const uint32x4_t multiplier = vdupq_n_u32(0x9E3779B1u);
++    const auto mix16 = [&](const std::uint8_t *bytes) noexcept {
++        state = veorq_u32(state, vreinterpretq_u32_u8(vld1q_u8(bytes)));
++        state = vmulq_u32(state, multiplier);
++        state = veorq_u32(state, vshrq_n_u32(state, 15));
+     };
++#else
++    const auto mix16 = [&](const std::uint8_t *bytes) noexcept {
++        for (std::uint32_t lane = 0u; lane < 4u; ++lane) {
++            std::uint32_t word;
++            std::memcpy(&word, bytes + lane * 4u, sizeof(word));
++            lanes[lane] = (lanes[lane] ^ word) * 0x9E3779B1u;
++            lanes[lane] ^= lanes[lane] >> 15u;
++        }
++    };
++#endif
+     const auto hash_range = [&](std::size_t begin, std::size_t end) noexcept {
+         std::size_t i = begin;
+-        while (i + 8u <= end) {
+-            std::uint64_t word{};
+-            std::memcpy(&word, pixels + i, sizeof(word));
+-            mix64(word);
+-            i += 8u;
+-        }
++        for (; i + 16u <= end; i += 16u) mix16(pixels + i);
+         if (i < end) {
+-            std::uint64_t tail = 0u;
+-            std::memcpy(&tail, pixels + i, end - i);
+-            mix64(tail ^ (static_cast<std::uint64_t>(end - i) << 56u));
++            std::uint8_t tail[16]{};
++            std::memcpy(tail, pixels + i, end - i);
++            tail[15] ^= static_cast<std::uint8_t>(end - i);
++            mix16(tail);
+         }
+     };
+     if (size <= 4096u) {
+@@ -2276,6 +2304,11 @@ std::uint64_t texture_source_signature(const psprecomp::GuestMemory &memory,
+             hash_range(begin, std::min(size, begin + block_bytes));
+         }
+     }
++#if defined(__ARM_NEON)
++    vst1q_u32(lanes, state);
++#endif
++    std::uint64_t hash = (static_cast<std::uint64_t>(lanes[0] ^ std::rotl(lanes[2], 13)) << 32u) |
++                         (lanes[1] ^ std::rotl(lanes[3], 17));
+     hash ^= static_cast<std::uint64_t>(size) +
+             (static_cast<std::uint64_t>(texture.width) << 32u) + texture.height;
+     hash *= 1099511628211ull;
+@@ -4392,7 +4425,17 @@ bool render_ge_primitive(psprecomp::GuestMemory &memory,
+             // one session, against 587 and 75 MB.
+             const std::uint32_t entry_bytes = gpu_draw.clut_format == 3u ? 4u : 2u;
+             const std::uint32_t first = std::min(gpu_draw.clut_start, 255u);
+-            const std::uint32_t last = std::min(first + gpu_draw.clut_mask, 255u);
++            // ... and no further than the texture's own index width reaches: a
++            // 4-bit texture reads 16 entries whatever the mask says (GTA leaves
++            // it at 0xFF). With the mask alone, the 240 entries after a 16-colour
++            // palette were part of its checksum: whatever lay there changed, the
++            // texture got a new key and was decoded and uploaded again (the
++            // 256 x 256 font page with its 8 levels every frame: 350 KB, 2-3 ms
++            // of the render thread, and a dead copy left in the cache each time).
++            const std::uint32_t widest_index = gpu_draw.texture_format == 4u ? 0xFu
++                : gpu_draw.texture_format == 5u ? 0xFFu : 0xFFFFu;
++            const std::uint32_t reach = std::min(gpu_draw.clut_mask, widest_index >> std::min(gpu_draw.clut_shift, 31u));
++            const std::uint32_t last = std::min(first + reach, 255u);
+             const std::uint32_t offset_bytes = first * entry_bytes;
+             const std::uint32_t clut_bytes = (last - first + 1u) * entry_bytes;
+             // Cached per palette while its pages are unwritten (ported from
+diff --git a/profiles/vcs/host/vcs_profile.cpp b/profiles/vcs/host/vcs_profile.cpp
+index fb5c468..5ba35a5 100644
+--- a/profiles/vcs/host/vcs_profile.cpp
++++ b/profiles/vcs/host/vcs_profile.cpp
+@@ -2402,6 +2402,18 @@ void sas_render_voice(const psprecomp::GuestMemory &memory, SasVoiceState &voice
+                 (static_cast<std::int64_t>(left_volume) * envelope) >> 30;
+             const std::int64_t right_gain =
+                 (static_cast<std::int64_t>(right_volume) * envelope) >> 30;
++            // A silent bus adds nothing (most voices send nothing to the
++            // effect bus), and a gain that fits 32 bits (every real one: a
++            // 13-bit volume times the envelope) multiplies as one 32 x 32 -> 64
++            // instead of a 64-bit product. Same sums either way.
++            if (left_gain == 0 && right_gain == 0) return;
++            const auto narrow_left = static_cast<std::int32_t>(left_gain);
++            const auto narrow_right = static_cast<std::int32_t>(right_gain);
++            if (narrow_left == left_gain && narrow_right == right_gain) {
++                target[frame * 2u] += static_cast<std::int32_t>((static_cast<std::int64_t>(sample) * narrow_left) >> 12);
++                target[frame * 2u + 1u] += static_cast<std::int32_t>((static_cast<std::int64_t>(sample) * narrow_right) >> 12);
++                return;
++            }
+             target[frame * 2u] += static_cast<std::int32_t>((sample * left_gain) >> 12);
+             target[frame * 2u + 1u] += static_cast<std::int32_t>((sample * right_gain) >> 12);
+         };
+@@ -3437,6 +3449,12 @@ void promote_expired_delays() {
+         std::uint64_t deadline{};
+         std::uint64_t sequence{};
+     };
++    // (Usually none has expired: look before allocating the list.)
++    bool any_expired = false;
++    for (const auto &[uid, thread] : thread_table.threads) {
++        if (thread.state == ThreadState::Delayed && thread.delay_until_us <= virtual_time_us) { any_expired = true; break; }
++    }
++    if (!any_expired) return;
+     std::vector<ExpiredDelay> expired;
+     expired.reserve(thread_table.threads.size());
+     for (const auto &[uid, thread] : thread_table.threads) {
+@@ -4988,14 +5006,24 @@ bool execute_ge_list(psprecomp::Runtime &runtime, GeListRecord &list,
+     };
+ 
+     list.state = GeListState::Running;
++    // The stall address the game thread moves forward as it writes the list
++    // (async GE): read once, and again only when the list reaches the address
++    // read (it cannot pass the newer one without reaching the older first:
++    // the game appends commands, then moves the stall past them) or while no
++    // stall is set. An atomic load for every command made the worker fetch
++    // the game thread's cache line each time: 5.6% of the worker's samples.
++    std::uint32_t effective_stall = async_stall != nullptr
++        ? async_stall->load(std::memory_order_acquire) : list.stall;
+     while (list.executed_commands < kMaximumCommandsPerRun) {
+-        const std::uint32_t effective_stall = async_stall != nullptr
+-            ? async_stall->load(std::memory_order_acquire) : list.stall;
+-        if (effective_stall != 0u && list.pc == effective_stall) {
+-            list.stall = effective_stall;
+-            list.state = GeListState::Stalled;
+-            log_ge_histogram(list);
+-            return true;
++        if (effective_stall == 0u || list.pc == effective_stall) {
++            effective_stall = async_stall != nullptr
++                ? async_stall->load(std::memory_order_acquire) : list.stall;
++            if (effective_stall != 0u && list.pc == effective_stall) {
++                list.stall = effective_stall;
++                list.state = GeListState::Stalled;
++                log_ge_histogram(list);
++                return true;
++            }
+         }
+         std::uint32_t op{};
+         if ((list.pc & 3u) != 0u || !fetch_ge_command(list.pc, op)) {
+diff --git a/profiles/vcs/host/vcs_world_clip.hpp b/profiles/vcs/host/vcs_world_clip.hpp
+new file mode 100644
+index 0000000..53083d1
+--- /dev/null
++++ b/profiles/vcs/host/vcs_world_clip.hpp
+@@ -0,0 +1,33 @@
++#pragma once
++
++#include <cstdlib>
++
++namespace vcs {
++
++// The game clips its world geometry itself: the PSP's graphics chip drops a
++// triangle that leaves its 4096 x 4096 drawing space instead of clipping it,
++// so for every mesh that crosses an edge of the view the game walks the
++// strip vertex by vertex (0x08A09B2C: int16 position to float, a 4 x 4
++// transform, four plane tests), cuts the strip at each triangle that crosses
++// a plane, clips that triangle on the CPU (0x08A08F00) and draws the pieces
++// as separate primitives. A mesh wholly inside the view takes the game's
++// direct path: one strip, as stored.
++//
++// A GL driver clips every triangle against the view volume itself, so under
++// GLES 2 every mesh takes that direct path (the two places that choose, in
++// generated unit 0085, ask here): the same picture without the per-vertex
++// walk (9% of the game thread on a busy street), the CPU clipper and the
++// extra primitives. VCS_GPU_CLIP=0: the game clips, as on the PSP.
++[[nodiscard]] inline bool vcs_world_clipped_by_gpu() noexcept {
++#if defined(VCS_GLES2_GE_BACKEND)
++    static const bool enabled = [] {
++        const char *text = std::getenv("VCS_GPU_CLIP");
++        return text == nullptr || *text == '\0' || *text != '0';
++    }();
++    return enabled;
++#else
++    return false;
++#endif
++}
++
++}  // namespace vcs

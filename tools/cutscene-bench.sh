@@ -7,7 +7,7 @@
 #   tools/cutscene-bench.sh <binary in ports/gtavcs-psp> [VAR=value ...]
 # Needs glos/testing on the console (../goodluckOS-tools/testing-sync.sh gtavcs-psp).
 set -eu
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../../goodluckOS-tools"
 binary=$1
 shift
 GLOS_TIMEOUT=900 python3 -I console.py "/usr/local/bin/appctl stop-application; w=0; while pidof VCSNative $binary >/dev/null && [ \$w -lt 30 ]; do sleep 1; w=\$((w+1)); done; sleep 4

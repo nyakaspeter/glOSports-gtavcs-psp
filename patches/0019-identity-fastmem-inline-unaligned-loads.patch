@@ -1,0 +1,547 @@
+diff --git a/include/psprecomp/guest_memory.hpp b/include/psprecomp/guest_memory.hpp
+index e3a554a..5306eea 100644
+--- a/include/psprecomp/guest_memory.hpp
++++ b/include/psprecomp/guest_memory.hpp
+@@ -74,6 +74,55 @@ public:
+     // and no out-of-line slow path (a guest `lw` went from 10 host
+     // instructions and a branch to 5). Writes to unmapped physical addresses
+     // land in private zero pages, as the old slow path's "ignore" did.
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++    // Identity fastmem (32-bit hosts): the PSP's memory is mapped at its own
++    // addresses (see the constructor), so a guest address is the host address:
++    // a guest load is one host load with the guest's own base register and
++    // offset, with no mask and no window base to add (and no register held
++    // for the base). The page marks are indexed by the whole address (64 K
++    // entries), folded onto the canonical pages by fold_dirty_pages().
++    class AotFastView {
++    public:
++        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
++            return *host(address);
++        }
++        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint16_t aot_load16(std::uint32_t address) const {
++            return GuestMemory::read_le16(host(address));
++        }
++        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load32(std::uint32_t address) const {
++            return GuestMemory::read_le32(host(address));
++        }
++        PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) const {
++            *host(address) = value;
++            dirty_[address >> kPageShift] = 1u;
++        }
++        PSPRECOMP_MEMORY_FAST_PATH void aot_store16(std::uint32_t address, std::uint16_t value) const {
++            GuestMemory::write_le16(host(address), value);
++            dirty_[address >> kPageShift] = 1u;
++        }
++        PSPRECOMP_MEMORY_FAST_PATH void aot_store32(std::uint32_t address, std::uint32_t value) const {
++            GuestMemory::write_le32(host(address), value);
++            dirty_[address >> kPageShift] = 1u;
++        }
++#if defined(__ARM_NEON)
++        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH float32x4_t aot_load128(std::uint32_t address) const {
++            return vreinterpretq_f32_u8(vld1q_u8(host(address)));
++        }
++        PSPRECOMP_MEMORY_FAST_PATH void aot_store128(std::uint32_t address, float32x4_t value) const {
++            vst1q_u8(host(address), vreinterpretq_u8_f32(value));
++            dirty_[address >> kPageShift] = 1u;
++        }
++#endif
++
++    private:
++        friend class GuestMemory;
++        explicit AotFastView(std::uint8_t *dirty) noexcept : dirty_(dirty) {}
++        [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH static std::uint8_t *host(std::uint32_t address) noexcept {
++            return reinterpret_cast<std::uint8_t *>(static_cast<std::uintptr_t>(address));
++        }
++        std::uint8_t *dirty_{};
++    };
++#else
+     class AotFastView {
+     public:
+         [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint8_t aot_load8(std::uint32_t address) const {
+@@ -129,15 +178,27 @@ public:
+         std::uint8_t *window_{};
+         std::uint8_t *dirty_{};
+     };
++#endif
+ 
+     static constexpr std::uint32_t kWindowMask = 0x1FFFFFFFu;
+     static constexpr std::size_t kWindowBytes = 0x20000000u;
+     static constexpr std::uint32_t kPageShift = 16u;
+     static constexpr std::size_t kPageCount = kWindowBytes >> kPageShift;
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++    static constexpr std::size_t kDirtyCount = std::size_t{1} << (32u - kPageShift);
++    // The three mirrors mapped at start (user, uncached, kernel).
++    static constexpr std::uint32_t kIdentityMirrors[3] = {0x00000000u, 0x40000000u, 0x80000000u};
++
++    [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
++        return AotFastView(dirty_.data());
++    }
++#else
++    static constexpr std::size_t kDirtyCount = kPageCount;
+ 
+     [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH AotFastView aot_fast_view() noexcept {
+         return AotFastView(window_, dirty_.data());
+     }
++#endif
+ 
+     // The generated code's stores mark pages in dirty_; this bumps the
+     // generation of every marked page once and clears the marks. Called on the
+@@ -145,17 +206,28 @@ public:
+     // read data the guest wrote (the GE hand-over), with no reader running.
+     void fold_dirty_pages() noexcept {
+         std::uint8_t *const marks = dirty_.data();
+-        for (std::size_t base = 0u; base < kPageCount; base += 8u) {
+-            std::uint64_t word;
+-            std::memcpy(&word, marks + base, sizeof(word));
+-            if (word == 0u) continue;
+-            for (std::size_t page = base; page < base + 8u; ++page) {
+-                if (marks[page] != 0u) {
+-                    marks[page] = 0u;
+-                    ++generations_[page];
++        const auto fold = [&](std::size_t first, std::size_t count) {
++            for (std::size_t base = first; base < first + count; base += 8u) {
++                std::uint64_t word;
++                std::memcpy(&word, marks + base, sizeof(word));
++                if (word == 0u) continue;
++                for (std::size_t page = base; page < base + 8u; ++page) {
++                    if (marks[page] != 0u) {
++                        marks[page] = 0u;
++                        ++generations_[page & (kPageCount - 1u)];
++                    }
+                 }
+             }
+-        }
++        };
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++        // The marks of the mapped mirrors: the pages below the end of RAM in
++        // each. Everything, once another mirror was mapped on demand.
++        if (identity_all_mirrors_) { fold(0u, kDirtyCount); return; }
++        const std::size_t pages = (static_cast<std::size_t>(kPhysicalBase) + bytes_.size() + 0xFFFFu) >> kPageShift;
++        for (const std::uint32_t mirror : kIdentityMirrors) fold(mirror >> kPageShift, (pages + 7u) & ~std::size_t{7});
++#else
++        fold(0u, kPageCount);
++#endif
+     }
+ 
+     // Sum of the page generations a range touches. Host writes bump them too,
+@@ -203,8 +275,20 @@ public:
+         if (offset <= ram_limit32_) return read_le32(ram_data_ + offset);
+         return aot_load32_slow(address);
+     }
+-    [[nodiscard]] std::uint32_t aot_load_word_left(std::uint32_t address, std::uint32_t existing) const;
+-    [[nodiscard]] std::uint32_t aot_load_word_right(std::uint32_t address, std::uint32_t existing) const;
++    // lwl / lwr (an unaligned 32-bit load is a pair of them): inline, through
++    // the fastmem view like every other generated load. They were calls into
++    // the core library, three pairs in the collision code's vertex fetch
++    // alone (0x08A9061C, the most called leaf).
++    [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load_word_left(std::uint32_t address, std::uint32_t existing) const {
++        const std::uint32_t shift = (address & 3u) * 8u;
++        const std::uint32_t memory_word = const_cast<GuestMemory *>(this)->aot_fast_view().aot_load32(address & ~3u);
++        return (existing & (0x00FFFFFFu >> shift)) | (memory_word << (24u - shift));
++    }
++    [[nodiscard]] PSPRECOMP_MEMORY_FAST_PATH std::uint32_t aot_load_word_right(std::uint32_t address, std::uint32_t existing) const {
++        const std::uint32_t shift = (address & 3u) * 8u;
++        const std::uint32_t memory_word = const_cast<GuestMemory *>(this)->aot_fast_view().aot_load32(address & ~3u);
++        return (existing & (0xFFFFFF00u << (24u - shift))) | (memory_word >> shift);
++    }
+     PSPRECOMP_MEMORY_FAST_PATH void aot_store8(std::uint32_t address, std::uint8_t value) {
+         const std::uint32_t offset = ram_offset_of(address);
+ #if defined(PSPRECOMP_AOT_ASSUME_NO_WRITE_WATCH)
+@@ -387,7 +471,15 @@ private:
+     std::span<std::uint8_t> vram_;
+     std::span<std::uint8_t> bytes_;
+     std::vector<std::uint32_t> generations_ = std::vector<std::uint32_t>(kPageCount, 0u);
+-    std::vector<std::uint8_t> dirty_ = std::vector<std::uint8_t>(kPageCount, 0u);
++    std::vector<std::uint8_t> dirty_ = std::vector<std::uint8_t>(kDirtyCount, 0u);
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++    int ram_fd_{-1};
++    static bool identity_all_mirrors_;
++    static GuestMemory *identity_instance_;
++    static void identity_fault(int signal, void *info, void *context);
++    [[nodiscard]] bool identity_map_on_demand(std::uintptr_t address) noexcept;
++    [[nodiscard]] bool identity_selftest() noexcept;
++#endif
+     // Cached view of bytes_ for the inline fast paths.  Neither region is ever
+     // resized after construction, so these stay valid for the object's life.
+     //
+diff --git a/src/guest_memory.cpp b/src/guest_memory.cpp
+index 14bc5ea..233bf83 100644
+--- a/src/guest_memory.cpp
++++ b/src/guest_memory.cpp
+@@ -10,8 +10,18 @@
+ #include <limits>
+ 
+ #include <fcntl.h>
++#include <signal.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++#include <ucontext.h>
++extern "C" char __executable_start[];
++extern "C" char etext[];
++#endif
++
++#ifndef MAP_FIXED_NOREPLACE
++#define MAP_FIXED_NOREPLACE 0x100000
++#endif
+ 
+ namespace psprecomp {
+ 
+@@ -79,6 +89,53 @@ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+     if (size_bytes != 32u * 1024u * 1024u && size_bytes != 64u * 1024u * 1024u) {
+         throw Error("PSP RAM size must be 32 MiB or 64 MiB");
+     }
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++    // Identity fastmem: RAM and the four VRAM mirrors mapped at their own
++    // addresses, as user (0x0...), uncached (0x4...) and kernel (0x8...)
++    // mirrors of two files in /dev/shm, and the scratchpad at 0x00010000.
++    // The executable is linked away from these (build.sh: text segment at
++    // 0x10000000). Anything else the guest touches is mapped when it faults
++    // (identity_fault): the same memory for another mirror, zero pages
++    // otherwise, as the window gave it.
++    static_assert(sizeof(void *) == 4u, "identity fastmem needs a 32-bit host");
++    const auto backing = [](const char *kind, std::size_t bytes) {
++        char name[64];
++        std::snprintf(name, sizeof name, "/dev/shm/psprecomp-%s-%ld", kind, static_cast<long>(getpid()));
++        const int fd = open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
++        if (fd < 0) throw Error("Cannot create a guest memory backing file in /dev/shm");
++        unlink(name);
++        if (ftruncate(fd, static_cast<off_t>(bytes)) != 0) throw Error("Cannot size a guest memory backing file");
++        return fd;
++    };
++    const auto map_at = [](std::uint32_t address, std::size_t bytes, int fd) {
++        void *const at = reinterpret_cast<void *>(static_cast<std::uintptr_t>(address));
++        void *const got = fd >= 0
++            ? mmap(at, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0)
++            : mmap(at, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++        if (got != at) {
++            if (got != MAP_FAILED) munmap(got, bytes);
++            throw Error("Cannot map guest memory at " + hex32(address) + " (the address is taken)");
++        }
++    };
++    vram_fd_ = backing("vram", kVramSize);
++    ram_fd_ = backing("ram", size_bytes);
++    for (const std::uint32_t mirror : kIdentityMirrors) {
++        map_at(mirror + kPhysicalBase, size_bytes, ram_fd_);
++        for (std::uint32_t copy = 0u; copy < kVramMirrorCount; ++copy)
++            map_at(mirror + kVramPhysicalBase + copy * kVramSize, kVramSize, vram_fd_);
++    }
++    map_at(0x00010000u, 0x4000u, -1);
++    vram_ = std::span<std::uint8_t>(reinterpret_cast<std::uint8_t *>(static_cast<std::uintptr_t>(kVramPhysicalBase)), kVramSize);
++    bytes_ = std::span<std::uint8_t>(reinterpret_cast<std::uint8_t *>(static_cast<std::uintptr_t>(kPhysicalBase)), size_bytes);
++    identity_instance_ = this;
++    struct sigaction action {};
++    action.sa_sigaction = [](int signal, siginfo_t *info, void *context) { identity_fault(signal, info, context); };
++    action.sa_flags = SA_SIGINFO | SA_NODEFER;
++    sigemptyset(&action.sa_mask);
++    sigaction(SIGSEGV, &action, nullptr);
++    if (const char *test = std::getenv("PSPRECOMP_FASTMEM_SELFTEST"); test != nullptr && *test != '\0' && *test != '0')
++        std::cerr << "[fastmem] null-page self-test " << (identity_selftest() ? "passed" : "FAILED") << "\n";
++#else
+     // One 512 MB window for the whole 29-bit physical space: zero pages
+     // everywhere (MAP_NORESERVE, so untouched pages cost nothing), RAM at
+     // +0x08000000, the scratchpad at +0x00010000, and VRAM as four mirrors of
+@@ -101,6 +158,7 @@ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+     }
+     vram_ = std::span<std::uint8_t>(window_ + kVramPhysicalBase, kVramSize);
+     bytes_ = std::span<std::uint8_t>(window_ + kPhysicalBase, size_bytes);
++#endif
+     // Bind the inline host fast paths to main RAM. The window is never moved
+     // and the instance is non-copyable, so this stays valid.
+     ram_data_ = bytes_.data();
+@@ -110,10 +168,266 @@ GuestMemory::GuestMemory(std::uint32_t size_bytes)
+ }
+ 
+ GuestMemory::~GuestMemory() {
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++    // The mappings stay until the process ends (the generated code may still
++    // run on another thread while the runtime is torn down).
++    if (identity_instance_ == this) identity_instance_ = nullptr;
++    if (ram_fd_ >= 0) close(ram_fd_);
++#else
+     if (window_ != nullptr) munmap(window_, kWindowBytes);
++#endif
+     if (vram_fd_ >= 0) close(vram_fd_);
+ }
+ 
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++bool GuestMemory::identity_all_mirrors_ = false;
++GuestMemory *GuestMemory::identity_instance_ = nullptr;
++
++// Maps what the guest touched outside the mirrors mapped at start: RAM or
++// VRAM through another mirror gets the same memory, any other address a
++// private zero page block (64 KB). False when the address cannot be mapped
++// (the first page, the kernel's part of the address space, or host memory).
++bool GuestMemory::identity_map_on_demand(std::uintptr_t address) noexcept {
++    if (address < 0x1000u || address >= 0xC0000000u) return false;
++    const std::uint32_t mirror = static_cast<std::uint32_t>(address) & 0xE0000000u;
++    const std::uint32_t physical = static_cast<std::uint32_t>(address) & kWindowMask;
++    const auto map_at = [](std::uint32_t at_address, std::size_t bytes, int fd) {
++        void *const at = reinterpret_cast<void *>(static_cast<std::uintptr_t>(at_address));
++        void *const got = fd >= 0
++            ? mmap(at, bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED_NOREPLACE, fd, 0)
++            : mmap(at, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
++        if (got == at) return true;
++        if (got != MAP_FAILED) munmap(got, bytes);
++        return false;
++    };
++    if (physical >= kPhysicalBase && physical - kPhysicalBase < bytes_.size()) {
++        if (!map_at(mirror + kPhysicalBase, bytes_.size(), ram_fd_)) return false;
++        identity_all_mirrors_ = true;
++        return true;
++    }
++    if (physical >= kVramPhysicalBase && physical - kVramPhysicalBase < kVramAddressSpan) {
++        const std::uint32_t copy = (physical - kVramPhysicalBase) / kVramSize;
++        if (!map_at(mirror + kVramPhysicalBase + copy * kVramSize, kVramSize, vram_fd_)) return false;
++        identity_all_mirrors_ = true;
++        return true;
++    }
++    return map_at(static_cast<std::uint32_t>(address) & ~0xFFFFu, 0x10000u, -1);
++}
++
++namespace {
++// The first page cannot be mapped (vm.mmap_min_addr), and a guest load
++// through a null pointer plus a small offset lands there. In the window such
++// a load read zero and a store went nowhere that mattered; here the handler
++// does the same for the faulting instruction itself: it finds the load's
++// destination (a core register, a VFP register or NEON registers) and zeroes
++// it, drops a store, applies the instruction's base register writeback, and
++// steps over it (advancing the IT state). Only for Thumb-2 code inside this
++// executable (the generated units), and only the load and store forms GCC
++// emits for the accessors; anything else stays a crash, with a line saying so.
++bool emulate_null_page_access(void *context_pointer) noexcept {
++    auto *const context = static_cast<ucontext_t *>(context_pointer);
++    auto &machine = context->uc_mcontext;
++    const std::uintptr_t pc = machine.arm_pc & ~std::uintptr_t{1};
++    if ((machine.arm_cpsr & (1u << 5u)) == 0u) return false;  // ARM state: not the generated code
++    if (pc < reinterpret_cast<std::uintptr_t>(__executable_start) || pc >= reinterpret_cast<std::uintptr_t>(etext))
++        return false;
++    unsigned long *const reg = &machine.arm_r0;  // r0..r15 in order
++    std::uint16_t hw1, hw2 = 0u;
++    std::memcpy(&hw1, reinterpret_cast<const void *>(pc), 2u);
++    unsigned length = 2u;
++    // The VFP registers of the interrupted code, in the signal frame.
++    const auto vfp = [&]() -> unsigned long long * {
++        unsigned long *frame = context->uc_regspace;
++        for (int guard = 0; guard < 8 && frame[0] != 0u; ++guard) {
++            if (frame[0] == 0x56465001u) return reinterpret_cast<unsigned long long *>(frame + 2);
++            if (frame[1] < 8u || frame[1] > sizeof(context->uc_regspace)) break;
++            frame = reinterpret_cast<unsigned long *>(reinterpret_cast<char *>(frame) + frame[1]);
++        }
++        return nullptr;
++    };
++    if ((hw1 & 0xF800u) == 0x6800u || (hw1 & 0xF800u) == 0x7800u || (hw1 & 0xF800u) == 0x8800u) {
++        reg[hw1 & 7u] = 0u;                                     // LDR / LDRB / LDRH Rt, [Rn, #imm5]
++    } else if ((hw1 & 0xF800u) == 0x6000u || (hw1 & 0xF800u) == 0x7000u || (hw1 & 0xF800u) == 0x8000u) {
++        // STR / STRB / STRH Rt, [Rn, #imm5]: dropped
++    } else if ((hw1 & 0xF000u) == 0x5000u) {
++        if (((hw1 >> 9u) & 7u) >= 3u) reg[hw1 & 7u] = 0u;       // register offset: 3..7 are the loads
++    } else if ((hw1 & 0xF800u) >= 0xE800u) {
++        std::memcpy(&hw2, reinterpret_cast<const void *>(pc + 2u), 2u);
++        length = 4u;
++        const unsigned rn = hw1 & 15u;
++        if ((hw1 & 0xFE00u) == 0xF800u && !((hw1 & 0x0100u) != 0u && (hw1 & 0x0010u) == 0u)) {
++            // LDR/LDRB/LDRH/LDRSB/LDRSH/STR/STRB/STRH, 12-bit, 8-bit or register offset
++            // (0xF9.. with the load bit clear is not a store: that is NEON, below)
++            const unsigned rt = hw2 >> 12u;
++            const bool load = (hw1 & 0x0010u) != 0u;
++            if (rn == 15u || (load && rt == 15u)) return false;  // literal, preload or a branch
++            if (load) reg[rt] = 0u;
++            if ((hw1 & 0x0080u) == 0u && (hw2 & 0x0800u) != 0u && (hw2 & 0x0100u) != 0u) {
++                const unsigned long offset = hw2 & 0xFFu;       // writeback
++                reg[rn] = (hw2 & 0x0200u) != 0u ? reg[rn] + offset : reg[rn] - offset;
++            }
++        } else if ((hw1 & 0xFE40u) == 0xE840u && (hw1 & 0x0120u) != 0u) {
++            // LDRD / STRD Rt, Rt2, [Rn, #imm8 * 4]
++            if (rn == 15u) return false;
++            if ((hw1 & 0x0010u) != 0u) { reg[hw2 >> 12u] = 0u; reg[(hw2 >> 8u) & 15u] = 0u; }
++            if ((hw1 & 0x0020u) != 0u) {
++                const unsigned long offset = (hw2 & 0xFFu) * 4u;
++                reg[rn] = (hw1 & 0x0080u) != 0u ? reg[rn] + offset : reg[rn] - offset;
++            }
++        } else if ((hw1 & 0xFF20u) == 0xED00u && (hw2 & 0x0E00u) == 0x0A00u) {
++            // VLDR / VSTR Sd or Dd, [Rn, #imm8 * 4]
++            if ((hw1 & 0x0010u) != 0u) {
++                unsigned long long *const registers = vfp();
++                if (registers == nullptr) return false;
++                const unsigned vd = hw2 >> 12u;
++                const unsigned d = (hw1 >> 6u) & 1u;
++                if ((hw2 & 0x0100u) != 0u) {
++                    registers[(d << 4u) | vd] = 0u;             // Dd
++                } else {
++                    const unsigned single = (vd << 1u) | d;     // Sd: half of D(single / 2)
++                    const unsigned shift = (single & 1u) * 32u;
++                    registers[single >> 1u] &= ~(0xFFFFFFFFull << shift);
++                }
++            }
++        } else if ((hw1 & 0xFF90u) == 0xF900u) {
++            // VLD1 / VST1 (whole registers) [Rn], optional writeback
++            const unsigned type = (hw2 >> 8u) & 15u;
++            const unsigned count = type == 7u ? 1u : type == 10u ? 2u : type == 6u ? 3u : type == 2u ? 4u : 0u;
++            if (count == 0u) return false;
++            if ((hw1 & 0x0020u) != 0u) {
++                unsigned long long *const registers = vfp();
++                if (registers == nullptr) return false;
++                const unsigned first = (((hw1 >> 6u) & 1u) << 4u) | (hw2 >> 12u);
++                for (unsigned index = 0u; index < count && first + index < 32u; ++index) registers[first + index] = 0u;
++            }
++            const unsigned rm = hw2 & 15u;
++            if (rm == 13u) reg[rn] += 8u * count;
++            else if (rm != 15u) reg[rn] += reg[rm];
++        } else {
++            return false;
++        }
++    } else {
++        return false;
++    }
++    // Step over it; inside an IT block the state moves on as if it had run.
++    unsigned long cpsr = machine.arm_cpsr;
++    unsigned it = static_cast<unsigned>(((cpsr >> 8u) & 0xFCu) | ((cpsr >> 25u) & 3u));
++    if ((it & 7u) == 0u) it = 0u;
++    else it = (it & 0xE0u) | ((it << 1u) & 0x1Fu);
++    cpsr = (cpsr & ~0x0600FC00ul) | ((it & 0xFCul) << 8u) | ((it & 3ul) << 25u);
++    machine.arm_cpsr = cpsr;
++    machine.arm_pc = (pc + length) | 1u;
++    return true;
++}
++}  // namespace
++
++void GuestMemory::identity_fault(int signal, void *info, void *context) {
++    const auto address = reinterpret_cast<std::uintptr_t>(static_cast<siginfo_t *>(info)->si_addr);
++    static std::atomic<int> logged{0};
++    const auto say = [&](const char *what) {
++        if (logged.fetch_add(1) >= 16) return;
++        char line[112];
++        const int length = std::snprintf(line, sizeof line, "[fastmem] guest access at 0x%08lx: %s\n",
++                                         static_cast<unsigned long>(address), what);
++        if (length > 0) (void)!write(2, line, static_cast<std::size_t>(length));
++    };
++    if (address < 0x1000u) {
++        if (emulate_null_page_access(context)) { say("null page, read as zero"); return; }
++        say("null page, by an instruction the handler does not know");
++        ::signal(signal, SIG_DFL);
++        return;
++    }
++    GuestMemory *const memory = identity_instance_;
++    if (memory != nullptr && memory->identity_map_on_demand(address)) {
++        say("mapped on demand");
++        return;   // the access runs again
++    }
++    say("cannot be mapped");
++    ::signal(signal, SIG_DFL);
++}
++
++// PSPRECOMP_FASTMEM_SELFTEST=1: null-page loads and stores of every kind the
++// accessors make, through the handler, before the game starts.
++namespace {
++// One access form each, so a failure names it.
++using View = GuestMemory::AotFastView;
++[[gnu::noinline]] std::uint32_t st_load8(View v, volatile std::uint32_t *b) { return v.aot_load8(*b + 3u); }
++[[gnu::noinline]] std::uint32_t st_load16(View v, volatile std::uint32_t *b) { return v.aot_load16(*b + 6u); }
++[[gnu::noinline]] std::uint32_t st_load32(View v, volatile std::uint32_t *b) { return v.aot_load32(*b + 8u); }
++[[gnu::noinline]] std::uint32_t st_load8s(View v, volatile std::uint32_t *b) {
++    return static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(v.aot_load8(*b + 13u))));
++}
++[[gnu::noinline]] std::uint32_t st_load16s(View v, volatile std::uint32_t *b) {
++    return static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(v.aot_load16(*b + 14u))));
++}
++[[gnu::noinline]] std::uint32_t st_pair(View v, volatile std::uint32_t *b) {
++    const std::uint32_t base = *b;
++    return v.aot_load32(base + 16u) + (v.aot_load32(base + 20u) << 1u);
++}
++[[gnu::noinline]] std::uint32_t st_far(View v, volatile std::uint32_t *b) { return v.aot_load32(*b + 2048u); }
++[[gnu::noinline]] std::uint32_t st_float(View v, volatile std::uint32_t *b) {
++    return static_cast<std::uint32_t>(std::bit_cast<float>(v.aot_load32(*b + 24u)) * 3.0f + 0.25f);
++}
++[[gnu::noinline]] std::uint32_t st_loop(View v, volatile std::uint32_t *b) {
++    const std::uint32_t base = *b;
++    std::uint32_t sum = 0u;
++    for (std::uint32_t offset = 32u; offset < 64u; offset += 4u) sum += v.aot_load32(base + offset);
++    return sum;
++}
++[[gnu::noinline]] std::uint32_t st_indexed(View v, volatile std::uint32_t *b, volatile std::uint32_t *i) {
++    return v.aot_load32(*b + *i) + v.aot_load16(*b + *i) + v.aot_load8(*b + *i);
++}
++[[gnu::noinline]] std::uint32_t st_vector(View v, volatile std::uint32_t *b) {
++#if defined(__ARM_NEON)
++    const uint32x4_t q = vreinterpretq_u32_f32(v.aot_load128(*b + 64u));
++    return vgetq_lane_u32(q, 0) | vgetq_lane_u32(q, 1) | vgetq_lane_u32(q, 2) | vgetq_lane_u32(q, 3);
++#else
++    (void)v; (void)b; return 0u;
++#endif
++}
++[[gnu::noinline]] std::uint32_t st_stores(View v, volatile std::uint32_t *b, volatile std::uint32_t *i, std::uint32_t value) {
++    const std::uint32_t base = *b;
++    v.aot_store8(base + 3u, static_cast<std::uint8_t>(value));
++    v.aot_store16(base + 6u, static_cast<std::uint16_t>(value));
++    v.aot_store32(base + 8u, value);
++    v.aot_store32(base + 16u, value);
++    v.aot_store32(base + 20u, value + 1u);
++    v.aot_store32(base + 24u, std::bit_cast<std::uint32_t>(static_cast<float>(value) * 0.5f));
++    v.aot_store32(base + *i, value);
++    for (std::uint32_t offset = 32u; offset < 64u; offset += 4u) v.aot_store32(base + offset, value);
++#if defined(__ARM_NEON)
++    v.aot_store128(base + 64u, vdupq_n_f32(1.0f));
++#endif
++    return v.aot_load32(base + 8u);  // still zero: the stores went nowhere
++}
++}  // namespace
++
++bool GuestMemory::identity_selftest() noexcept {
++    volatile std::uint32_t base = 0x10u;
++    volatile std::uint32_t index = 0x44u;
++    const View view = aot_fast_view();
++    bool ok = true;
++    const auto check = [&](const char *name, std::uint32_t value) {
++        if (value == 0u) return;
++        ok = false;
++        std::cerr << "[fastmem] self-test: " << name << " read " << hex32(value) << "\n";
++    };
++    check("8-bit load", st_load8(view, &base));
++    check("16-bit load", st_load16(view, &base));
++    check("32-bit load", st_load32(view, &base));
++    check("signed 8-bit load", st_load8s(view, &base));
++    check("signed 16-bit load", st_load16s(view, &base));
++    check("pair of loads", st_pair(view, &base));
++    check("load at a 12-bit offset", st_far(view, &base));
++    check("load into a float", st_float(view, &base));
++    check("loads in a loop", st_loop(view, &base));
++    check("register-indexed loads", st_indexed(view, &base, &index));
++    check("128-bit load", st_vector(view, &base));
++    check("stores", st_stores(view, &base, &index, 0x12345678u));
++    return ok;
++}
++#endif
++
+ std::uint32_t GuestMemory::size() const noexcept { return static_cast<std::uint32_t>(bytes_.size()); }
+ std::uint32_t GuestMemory::vram_size() const noexcept { return static_cast<std::uint32_t>(vram_.size()); }
+ 
+@@ -200,16 +514,6 @@ std::uint32_t GuestMemory::aot_load32_slow(std::uint32_t address) const {
+     return load32(address);
+ }
+ 
+-std::uint32_t GuestMemory::aot_load_word_left(std::uint32_t address, std::uint32_t existing) const {
+-    const std::uint32_t shift = (address & 3u) * 8u;
+-    const std::uint32_t memory_word = aot_load32(address & ~3u);
+-    return (existing & (0x00FFFFFFu >> shift)) | (memory_word << (24u - shift));
+-}
+-std::uint32_t GuestMemory::aot_load_word_right(std::uint32_t address, std::uint32_t existing) const {
+-    const std::uint32_t shift = (address & 3u) * 8u;
+-    const std::uint32_t memory_word = aot_load32(address & ~3u);
+-    return (existing & (0xFFFFFF00u << (24u - shift))) | (memory_word >> shift);
+-}
+ 
+ void GuestMemory::aot_store8_slow(std::uint32_t address, std::uint8_t value) {
+     if (write_watch_enabled_) { store8(address, value); return; }
+@@ -326,7 +630,11 @@ std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t length
+ const std::uint8_t *GuestMemory::raw_pointer(std::uint32_t address, std::size_t length) const noexcept {
+     // The mirrors make a VRAM run contiguous across a mirror boundary too.
+     if (!contains(address, length)) return nullptr;
++#if defined(PSPRECOMP_FASTMEM_IDENTITY)
++    return reinterpret_cast<const std::uint8_t *>(static_cast<std::uintptr_t>(canonical(address)));
++#else
+     return window_ + canonical(address);
++#endif
+ }
+ 
+ std::uint8_t GuestMemory::load8_checked(std::uint32_t address) const {

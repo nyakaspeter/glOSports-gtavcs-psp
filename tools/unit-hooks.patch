@@ -1,0 +1,775 @@
+--- a/generated_unit_0027.cpp
++++ b/generated_unit_0027.cpp
+@@ -3137,14 +3137,7 @@
+       goto L_08870E6C;
+     }
+ L_08870E6C:
+-    // break (unhandled trap; treated as a no-op)
+-    { const bool branch_taken = 0u == 0u;
+-    // nop
+-      if (branch_taken) {
+-          goto L_08870A90;
+-      }
+-      goto L_08870E78;
+-    }
++    rt.unsupported(0x08870E6Cu, 0x0000000Du, "special? not lowered yet"); return;
+ L_08870E78:
+     r4 = (2237u << 16u);
+     r31 = (0x08870E84u);
+@@ -4216,14 +4209,7 @@
+       goto L_088712E4;
+     }
+ L_088712E4:
+-    // break (unhandled trap; treated as a no-op)
+-    { const bool branch_taken = 0u == 0u;
+-    // nop
+-      if (branch_taken) {
+-          goto L_08870A90;
+-      }
+-      goto L_088712F0;
+-    }
++    rt.unsupported(0x088712E4u, 0x0000000Du, "special? not lowered yet"); return;
+ L_088712F0:
+     r29 = ctx.gpr[29];
+     r16 = (aot_mem.aot_load32(r29 + static_cast<std::uint32_t>(24)));
+--- a/generated_unit_0076.cpp
++++ b/generated_unit_0076.cpp
+@@ -1,11 +1,27 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
++#include "vcs_config.hpp"
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+ #include <limits>
+ 
+ namespace psprecomp {
++static float get_effective_aspect_ratio(float default_aspect) noexcept {
++    const vcs::VcsConfiguration &config = vcs::vcs_configuration();
++    if (!config.initialized) return default_aspect;
++    const vcs::DisplaySurfaceDimensions output =
++        vcs::resolve_display_surface_dimensions(config.display);
++    const float aspect = vcs::resolve_widescreen_aspect_ratio(config, output.width, output.height);
++    return (aspect > 0.0f) ? aspect : default_aspect;
++}
++static float widen_horizontal_extent(float native_extent) noexcept {
++    const vcs::VcsConfiguration &config = vcs::vcs_configuration();
++    if (!config.initialized) return native_extent;
++    const vcs::DisplaySurfaceDimensions output =
++        vcs::resolve_display_surface_dimensions(config.display);
++    return native_extent * vcs::widescreen_stretch_factor(config, output.width, output.height);
++}
+ void recomp_fn_08934048(Runtime &rt, AllegrexContext &ctx, std::uint16_t entry_id, GuestMemory::AotFastView &aot_mem_ref) {
+     // A local copy of the view: its address never escapes, so stores through
+     // the window cannot alias it and its pointers stay in registers.
+@@ -2190,7 +2206,8 @@
+     ctx.gpr[4] = (aot_mem.aot_load32(ctx.gpr[28] + static_cast<std::uint32_t>(8896)));
+     ctx.gpr[5] = (16355u << 16u);
+     ctx.gpr[5] = (ctx.gpr[5] | 36409u);
+-    ctx.fpr[13] = std::bit_cast<float>(ctx.gpr[5]);
++    ctx.fpr[13] = get_effective_aspect_ratio(std::bit_cast<float>(ctx.gpr[5]));
++    ctx.fpr[12] = widen_horizontal_extent(ctx.fpr[12]);
+     ctx.gpr[31] = (0x08934AE4u);
+     ctx.gpr[5] = (0u | 0u);
+     if (rt.invoke_chained_direct<&recomp_fn_0893A7A4, 77u, 0u, 0x0893A7A4u>(ctx, &aot_mem_ref) && ctx.pc == 0x08934AE4u) goto L_08934AE4;
+@@ -2388,10 +2405,11 @@
+     ctx.gpr[4] = (aot_mem.aot_load32(ctx.gpr[28] + static_cast<std::uint32_t>(8896)));
+     ctx.gpr[5] = (16355u << 16u);
+     ctx.gpr[5] = (ctx.gpr[5] | 36409u);
+-    ctx.fpr[13] = std::bit_cast<float>(ctx.gpr[5]);
++    ctx.fpr[13] = get_effective_aspect_ratio(std::bit_cast<float>(ctx.gpr[5]));
+     ctx.gpr[5] = (0u | 0u);
+     ctx.gpr[31] = (0x08934C60u);
+     ctx.fpr[12] = std::bit_cast<float>(std::bit_cast<std::uint32_t>(ctx.fpr[20]));
++    ctx.fpr[12] = widen_horizontal_extent(ctx.fpr[12]);
+     if (rt.invoke_chained_direct<&recomp_fn_0893A7A4, 77u, 0u, 0x0893A7A4u>(ctx, &aot_mem_ref) && ctx.pc == 0x08934C60u) goto L_08934C60;
+     return;
+ L_08934C60:
+@@ -7722,7 +7740,8 @@
+     ctx.gpr[6] = (16355u << 16u);
+     ctx.gpr[6] = (ctx.gpr[6] | 36409u);
+     ctx.gpr[31] = (0x089367B8u);
+-    ctx.fpr[13] = std::bit_cast<float>(ctx.gpr[6]);
++    ctx.fpr[13] = get_effective_aspect_ratio(std::bit_cast<float>(ctx.gpr[6]));
++    ctx.fpr[12] = widen_horizontal_extent(ctx.fpr[12]);
+     if (rt.invoke_chained_direct<&recomp_fn_0893A7A4, 77u, 0u, 0x0893A7A4u>(ctx, &aot_mem_ref) && ctx.pc == 0x089367B8u) goto L_089367B8;
+     return;
+ L_089367B8:
+@@ -12000,7 +12019,8 @@
+     ctx.gpr[4] = (aot_mem.aot_load32(ctx.gpr[28] + static_cast<std::uint32_t>(8896)));
+     ctx.gpr[5] = (16355u << 16u);
+     ctx.gpr[5] = (ctx.gpr[5] | 36409u);
+-    ctx.fpr[13] = std::bit_cast<float>(ctx.gpr[5]);
++    ctx.fpr[13] = get_effective_aspect_ratio(std::bit_cast<float>(ctx.gpr[5]));
++    ctx.fpr[12] = widen_horizontal_extent(ctx.fpr[12]);
+     ctx.gpr[31] = (0x08937EB8u);
+     ctx.gpr[5] = (0u | 0u);
+     if (rt.invoke_chained_direct<&recomp_fn_0893A7A4, 77u, 0u, 0x0893A7A4u>(ctx, &aot_mem_ref) && ctx.pc == 0x08937EB8u) goto L_08937EB8;
+--- a/generated_unit_0085.cpp
++++ b/generated_unit_0085.cpp
+@@ -1,5 +1,6 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
++#include "vcs_world_clip.hpp"
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+@@ -6124,6 +6125,10 @@
+       goto L_0895B168;
+     }
+ L_0895B168:
++    // The mesh is not wholly inside one of the four planes: the game would
++    // clip it. The GL driver clips, so it is drawn as the meshes that are
++    // inside (the last plane compare's outcome for those; vcs_world_clip.hpp).
++    if (vcs::vcs_world_clipped_by_gpu()) { ctx.vfpu_ctrl[3] |= 0x31u; goto L_0895B194; }
+     r30 = ctx.gpr[30];
+     r4 = (r30 | 0u);
+     r31 = (0x0895B174u);
+@@ -8821,6 +8826,9 @@
+ L_0895C1FC:
+     r29 = ctx.gpr[29];
+     r4 = (aot_mem.aot_load8(r29 + static_cast<std::uint32_t>(128)));
++    // The GL driver clips: the mesh's "needs clipping" flag reads as clear
++    // (see vcs_world_clip.hpp).
++    if (vcs::vcs_world_clipped_by_gpu()) r4 = 0u;
+     if (r4 == 0u) {
+     r8 = (aot_mem.aot_load32(r29 + static_cast<std::uint32_t>(100)));
+         ctx.gpr[4] = r4; ctx.gpr[8] = r8; goto L_0895C220;
+--- a/generated_unit_0092.cpp
++++ b/generated_unit_0092.cpp
+@@ -1,11 +1,20 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
++#include "vcs_config.hpp"
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+ #include <limits>
+ 
+ namespace psprecomp {
++static float get_effective_aspect_ratio(float default_aspect) noexcept {
++    const vcs::VcsConfiguration &config = vcs::vcs_configuration();
++    if (!config.initialized) return default_aspect;
++    const vcs::DisplaySurfaceDimensions output =
++        vcs::resolve_display_surface_dimensions(config.display);
++    const float aspect = vcs::resolve_widescreen_aspect_ratio(config, output.width, output.height);
++    return (aspect > 0.0f) ? aspect : default_aspect;
++}
+ void recomp_leaf_08974104(Runtime &rt, AllegrexContext &ctx, GuestMemory::AotFastView &aot_mem_ref) {
+     // A local copy of the view: its address never escapes, so stores through
+     // the window cannot alias it and its pointers stay in registers.
+@@ -5815,7 +5824,7 @@
+ L_08975DA4:
+     ctx.gpr[4] = (16355u << 16u);
+     ctx.gpr[4] = (ctx.gpr[4] | 36409u);
+-    ctx.fpr[0] = std::bit_cast<float>(ctx.gpr[4]);
++    ctx.fpr[0] = get_effective_aspect_ratio(std::bit_cast<float>(ctx.gpr[4]));
+     { const bool branch_taken = 0u == 0u;
+     aot_mem.aot_store32(ctx.gpr[28] + static_cast<std::uint32_t>(-16972), std::bit_cast<std::uint32_t>(ctx.fpr[0]));
+       if (branch_taken) {
+--- a/generated_unit_0096.cpp
++++ b/generated_unit_0096.cpp
+@@ -5418,14 +5418,12 @@
+       goto L_08985BCC;
+     }
+ L_08985BCC:
+-    // break (unhandled trap; treated as a no-op)
+-    ctx.gpr[4] = (ctx.gpr[17] | 0u);
+-    ctx.gpr[5] = (0u | 2u);
+-    ctx.gpr[6] = (0u | 0u);
+-    ctx.gpr[7] = (0u | 0u);
+-    ctx.gpr[31] = (0x08985BE8u);
+-    ctx.gpr[8] = (0u | 0u);
+-    if (rt.invoke_chained_direct<&recomp_fn_088FA418, 61u, 0u, 0x088FA418u>(ctx, &aot_mem_ref) && ctx.pc == 0x08985BE8u) goto L_08985BE8;
++    // The game's own `if (!ptr) trap();` after the pool allocator at
++    // 0x08938F04 returned NULL (upstream's hand-made hook, kept).
++    rt.unsupported(0x08985BCCu, 0x0000000Du,
++                    "pool-allocator assertion tripped (recomp_unit_0077 entry "
++                    "250/0x08938F04 returned NULL) -- see generated_unit_0096.cpp "
++                    "L_08985BCC");
+     return;
+ L_08985BE8:
+     ctx.gpr[2] = (0u | 0u);
+--- a/generated_unit_0098.cpp
++++ b/generated_unit_0098.cpp
+@@ -1,5 +1,9 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
++// Camera axes for the mouse and the pad's right stick; see the hook around
++// L_0898E098 below.
++#include "vcs_camera_input.hpp"
++#include "vcs_vehicle_input.hpp"
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+@@ -4243,7 +4247,16 @@
+       goto L_0898D15C;
+     }
+ L_0898D15C:
+-    ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(aot_mem.aot_load16(ctx.gpr[4] + static_cast<std::uint32_t>(38))))));
++    // Vehicle brake / reverse. Stock loads 38 (CPad NewState.SQUARE); same
++    // arrangement as the accelerator above, so S brakes in a car and stays
++    // plain analog movement on foot.
++    {
++        vcs::vcs_note_vehicle_control_read();
++        std::int16_t brake = static_cast<std::int16_t>(
++            aot_mem.aot_load16(ctx.gpr[4] + vcs::vcs_brake_pad_offset()));
++        if (brake == 0 && vcs::vcs_host_brake()) brake = 127;
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(brake)));
++    }
+     goto L_0898D160;
+ L_0898D160:
+     jump_target = ctx.gpr[31];
+@@ -4722,7 +4735,16 @@
+       goto L_0898D2F4;
+     }
+ L_0898D2F4:
+-    ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(aot_mem.aot_load16(ctx.gpr[4] + static_cast<std::uint32_t>(42))))));
++    // Vehicle accelerator. Stock loads 42 (CPad NewState.CROSS); the offset is
++    // a call so ModernControlScheme can move it to R, and the host key is ORed
++    // in so W drives without also sprinting on foot. See vcs_vehicle_input.hpp.
++    {
++        vcs::vcs_note_vehicle_control_read();
++        std::int16_t accelerate = static_cast<std::int16_t>(
++            aot_mem.aot_load16(ctx.gpr[4] + vcs::vcs_accelerate_pad_offset()));
++        if (accelerate == 0 && vcs::vcs_host_accelerate()) accelerate = 127;
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(accelerate)));
++    }
+     goto L_0898D2F8;
+ L_0898D2F8:
+     jump_target = ctx.gpr[31];
+@@ -7735,6 +7757,11 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB4C, 97u, 0u, 0x0898BB4Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898DE98u) goto L_0898DE98;
+     return;
+ L_0898DE98:
++    // Gun aim X: ThirteenAG's aimX, which prefers the stick the player is
++    // already holding and falls back to the second one. The call above is that
++    // first stick; when it comes back centred, the mouse takes over.
++    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
+     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
+     ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[16] + static_cast<std::uint32_t>(208)));
+     ctx.fpr[12] = static_cast<float>(static_cast<std::int32_t>(std::bit_cast<std::uint32_t>(ctx.fpr[12])));
+@@ -7755,6 +7782,11 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB4C, 97u, 0u, 0x0898BB4Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898DEC4u) goto L_0898DEC4;
+     return;
+ L_0898DEC4:
++    // Gun aim X: ThirteenAG's aimX, which prefers the stick the player is
++    // already holding and falls back to the second one. The call above is that
++    // first stick; when it comes back centred, the mouse takes over.
++    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
+     { const bool branch_taken = 0u == 0u;
+     // nop
+       if (branch_taken) {
+@@ -7768,6 +7800,11 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB4C, 97u, 0u, 0x0898BB4Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898DED4u) goto L_0898DED4;
+     return;
+ L_0898DED4:
++    // Gun aim X: ThirteenAG's aimX, which prefers the stick the player is
++    // already holding and falls back to the second one. The call above is that
++    // first stick; when it comes back centred, the mouse takes over.
++    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
+     ctx.gpr[4] = (2236u << 16u);
+     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
+     ctx.gpr[4] = (ctx.gpr[4] + static_cast<std::uint32_t>(32304));
+@@ -7911,6 +7948,9 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB8C, 97u, 0u, 0x0898BB8Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898DFA0u) goto L_0898DFA0;
+     return;
+ L_0898DFA0:
++    // Gun aim Y; the mirror of the X sites above.
++    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_y())));
+     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
+     ctx.gpr[4] = (aot_mem.aot_load8(ctx.gpr[28] + static_cast<std::uint32_t>(-16129)));
+     { const bool branch_taken = ctx.gpr[4] == 0u;
+@@ -7965,6 +8005,9 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB8C, 97u, 0u, 0x0898BB8Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E004u) goto L_0898E004;
+     return;
+ L_0898E004:
++    // Gun aim Y; the mirror of the X sites above.
++    if (vcs::vcs_camera_hook_enabled() && ctx.gpr[2] == 0u)
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_y())));
+     ctx.fpr[12] = std::bit_cast<float>(ctx.gpr[2]);
+     ctx.gpr[4] = (aot_mem.aot_load8(ctx.gpr[28] + static_cast<std::uint32_t>(-16129)));
+     { const bool branch_taken = ctx.gpr[4] == 0u;
+@@ -8064,10 +8107,22 @@
+         }
+     }
+ L_0898E080:
++    vcs::vcs_camera_note_site(0u);
+     ctx.gpr[29] = (ctx.gpr[29] + static_cast<std::uint32_t>(-16));
+     ctx.gpr[5] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(aot_mem.aot_load16(ctx.gpr[4] + static_cast<std::uint32_t>(0))))));
+     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(0), ctx.gpr[16]);
+     ctx.gpr[16] = (ctx.gpr[4] | 0u);
++    // The camera only runs once this counter reaches 7 -- the ramp that makes a
++    // held D-pad start panning. A mouse has no ramp, so the hook satisfies the
++    // condition by overriding the *loaded value*, not by forcing the branch.
++    //
++    // The difference matters. Forcing the branch also skips the store on the
++    // far side of the next test, and that store is what resets this same
++    // counter; without it the camera kept being driven past the point the game
++    // stops it, and the overshoot had to be unwound before it answered again --
++    // seizing at full pitch. Overriding the register leaves the counter, the
++    // reset and every other condition exactly as the game wrote them.
++    if (vcs::vcs_camera_hook_enabled()) ctx.gpr[5] = (7u);
+     ctx.gpr[4] = (static_cast<std::int32_t>(ctx.gpr[5]) < 7 ? 1u : 0u);
+     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(4), ctx.gpr[31]);
+     { const bool branch_taken = ctx.gpr[4] != 0u;
+@@ -8083,6 +8138,17 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898CE14, 98u, 0u, 0x0898CE14u>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E0A8u) goto L_0898E0A8;
+     return;
+ L_0898E0A8:
++    // Taken unconditionally with the hook on: ThirteenAG's beqz -> b at
++    // ptr + 0x10, the part of DualAnalogPatch this port had left out.
++    //
++    // The fall-through calls FindPlayerPed and tests the ped's field at 0x8C4,
++    // and one value of it diverts past the stick read entirely. That is a
++    // camera that stops answering in particular *player states* rather than at
++    // particular angles, which is why the seizing wandered between looking up
++    // and looking down, happened on the pad as well as the mouse, and cleared
++    // itself after a while. An earlier note here argued the opposite and left
++    // the branch alone; the pad reproducing the stall is what ruled that out.
++    if (vcs::vcs_camera_hook_enabled()) goto L_0898E104;
+     { const bool branch_taken = ctx.gpr[2] == 0u;
+     // nop
+       if (branch_taken) {
+@@ -8164,6 +8230,13 @@
+     if (rt.invoke_chained_direct<&recomp_leaf_0898B428, 97u, 828u, 0x0898B428u>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E124u) goto L_0898E124;
+     return;
+ L_0898E124:
++    vcs::vcs_camera_note_site(1u);
++    // Camera X from the host's mouse or right stick, replacing the pad read the
++    // game does here. See vcs_camera_axis_x().
++    if (vcs::vcs_camera_hook_enabled()) {
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_x())));
++        goto L_0898E12C;
++    }
+     ctx.gpr[31] = (0x0898E12Cu);
+     ctx.gpr[4] = (ctx.gpr[2] | 0u);
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB4C, 97u, 0u, 0x0898BB4Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E12Cu) goto L_0898E12C;
+@@ -8254,10 +8327,13 @@
+         }
+     }
+ L_0898E188:
++    vcs::vcs_camera_note_site(2u);
+     ctx.gpr[29] = (ctx.gpr[29] + static_cast<std::uint32_t>(-16));
+     ctx.gpr[5] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int16_t>(aot_mem.aot_load16(ctx.gpr[4] + static_cast<std::uint32_t>(0))))));
+     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(0), ctx.gpr[16]);
+     ctx.gpr[16] = (ctx.gpr[4] | 0u);
++    // The Y half of the same ramp; see the X half above.
++    if (vcs::vcs_camera_hook_enabled()) ctx.gpr[5] = (7u);
+     ctx.gpr[4] = (static_cast<std::int32_t>(ctx.gpr[5]) < 7 ? 1u : 0u);
+     aot_mem.aot_store32(ctx.gpr[29] + static_cast<std::uint32_t>(4), ctx.gpr[31]);
+     { const bool branch_taken = ctx.gpr[4] != 0u;
+@@ -8273,6 +8349,8 @@
+     if (rt.invoke_chained_direct<&recomp_fn_0898CE14, 98u, 0u, 0x0898CE14u>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E1B0u) goto L_0898E1B0;
+     return;
+ L_0898E1B0:
++    // The Y counterpart: ThirteenAG's beqz -> b at ptr + 0x118.
++    if (vcs::vcs_camera_hook_enabled()) goto L_0898E1BC;
+     { const bool branch_taken = ctx.gpr[2] == 0u;
+     // nop
+       if (branch_taken) {
+@@ -8285,6 +8363,10 @@
+     goto L_0898E1BC;
+ L_0898E1BC:
+     ctx.gpr[16] = (aot_mem.aot_load16(ctx.gpr[16] + static_cast<std::uint32_t>(150)));
++    // Pad Mode. The two branches below skip the camera read unless it is in
++    // [0,4); reported so the stall at full upward pitch can be attributed
++    // rather than guessed. See vcs_camera_note_mode().
++    vcs::vcs_camera_note_mode(static_cast<std::int16_t>(ctx.gpr[16]));
+     { const bool branch_taken = static_cast<std::int32_t>(ctx.gpr[16]) < 0;
+     ctx.fpr[12] = std::bit_cast<float>(0u);
+       if (branch_taken) {
+@@ -8307,6 +8389,12 @@
+     if (rt.invoke_chained_direct<&recomp_leaf_0898B428, 97u, 828u, 0x0898B428u>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E1DCu) goto L_0898E1DC;
+     return;
+ L_0898E1DC:
++    vcs::vcs_camera_note_site(3u);
++    // Camera Y; the mirror of the X read above.
++    if (vcs::vcs_camera_hook_enabled()) {
++        ctx.gpr[2] = (static_cast<std::uint32_t>(static_cast<std::int32_t>(vcs::vcs_camera_axis_y())));
++        goto L_0898E1E4;
++    }
+     ctx.gpr[31] = (0x0898E1E4u);
+     ctx.gpr[4] = (ctx.gpr[2] | 0u);
+     if (rt.invoke_chained_direct<&recomp_fn_0898BB8C, 97u, 0u, 0x0898BB8Cu>(ctx, &aot_mem_ref) && ctx.pc == 0x0898E1E4u) goto L_0898E1E4;
+@@ -8369,6 +8457,7 @@
+     ctx.gpr[2] = (0u | 0u);
+     goto L_0898E240;
+ L_0898E240:
++    vcs::vcs_camera_note_return(static_cast<std::int16_t>(ctx.gpr[2]));
+     ctx.gpr[16] = (aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(0)));
+     ctx.gpr[31] = (aot_mem.aot_load32(ctx.gpr[29] + static_cast<std::uint32_t>(4)));
+     jump_target = ctx.gpr[31];
+--- a/generated_unit_0102.cpp
++++ b/generated_unit_0102.cpp
+@@ -1,5 +1,6 @@
+ #include "psprecomp/runtime.hpp"
+ #include "generated_units.hpp"
++#include "vcs_camera_input.hpp"
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
+@@ -6520,6 +6521,17 @@
+     ctx.fpr[22] = std::bit_cast<float>(std::bit_cast<std::uint32_t>(ctx.fpr[20]));
+     goto L_0899EF6C;
+ L_0899EF6C:
++    // Do not move the game's own +45-degree clamp. Stop only upward input
++    // before it, leaving X/yaw and downward recovery untouched. Clearing the
++    // accumulated pitch speed prevents one last frame of momentum from carrying
++    // the camera into the stock endpoint.
++    if (std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[29] + 1104u)) > 1.0f &&
++        ctx.fpr[20] > 0.0f &&
++        std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[20] + 120u)) >=
++            vcs::vcs_ped_camera_up_limit_radians()) {
++        ctx.fpr[20] = 0.0f;
++        aot_mem.aot_store32(ctx.gpr[20] + 292u, 0u);
++    }
+     ctx.fpr[12] = std::bit_cast<float>(std::bit_cast<std::uint32_t>(ctx.fpr[22]) & 0x7FFFFFFFu);
+     ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[28] + static_cast<std::uint32_t>(-13704)));
+     ctx.fpr[13] = psprecomp::AllegrexContext::fpu_mul(ctx.fpr[13], ctx.fpr[13]);
+@@ -6766,6 +6778,21 @@
+     aot_mem.aot_store32(ctx.gpr[20] + static_cast<std::uint32_t>(292), std::bit_cast<std::uint32_t>(ctx.fpr[13]));
+     goto L_0899F19C;
+ L_0899F19C:
++    // Keep both the persistent pitch and the history target on the safe side
++    // without executing the game's stock upper-clamp branch. This is the
++    // distinction between moving the freeze to 40 degrees and never entering
++    // the problematic 45-degree endpoint at all.
++    if (std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[29] + 1104u)) > 1.0f) {
++        const float safe_limit = vcs::vcs_ped_camera_up_limit_radians();
++        if (ctx.fpr[24] > safe_limit) ctx.fpr[24] = safe_limit;
++        const float pitch =
++            std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[20] + 120u));
++        if (pitch > safe_limit) {
++            aot_mem.aot_store32(ctx.gpr[20] + 120u,
++                                    std::bit_cast<std::uint32_t>(safe_limit));
++            aot_mem.aot_store32(ctx.gpr[20] + 292u, 0u);
++        }
++    }
+     ctx.fpr[12] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[20] + static_cast<std::uint32_t>(120)));
+     ctx.fpr[13] = std::bit_cast<float>(aot_mem.aot_load32(ctx.gpr[28] + static_cast<std::uint32_t>(-13472)));
+     ctx.fpr[12] = ctx.fpr[13] - ctx.fpr[12];
+--- a/generated_unit_0199.cpp
++++ b/generated_unit_0199.cpp
+@@ -3439,8 +3439,7 @@
+       ctx.gpr[4] = r4; ctx.gpr[5] = r5; ctx.gpr[6] = r6; goto L_08B21394;
+     }
+ L_08B21394:
+-    // break (unhandled trap; treated as a no-op)
+-    goto L_08B21398;
++    rt.unsupported(0x08B21394u, 0x0000000Du, "special? not lowered yet"); return;
+ L_08B21398:
+     r31 = (0x08B213A0u);
+     // nop
+--- a/generated_unit_0215.cpp
++++ b/generated_unit_0215.cpp
+@@ -3219,7 +3219,7 @@
+     ctx.gpr[12] = (ctx.gpr[9] & 65535u);
+     ctx.gpr[4] = (ctx.gpr[14] >> 16u);
+     if (ctx.gpr[7] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B610DCu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B610E0;
+     }
+     goto L_08B610E0;
+@@ -3267,7 +3267,7 @@
+     { const std::uint32_t dividend = ctx.gpr[6]; const std::uint32_t divisor = ctx.gpr[7]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[14] & 65535u);
+     if (ctx.gpr[7] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B6113Cu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61140;
+     }
+     goto L_08B61140;
+@@ -3330,7 +3330,7 @@
+     ctx.gpr[2] = (0u + static_cast<std::uint32_t>(1));
+     { const std::uint32_t dividend = ctx.gpr[2]; const std::uint32_t divisor = ctx.gpr[7]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     if (ctx.gpr[6] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B611BCu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B611C0;
+     }
+     goto L_08B611C0;
+@@ -3385,7 +3385,7 @@
+     { const std::uint32_t dividend = ctx.gpr[10]; const std::uint32_t divisor = ctx.gpr[8]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[14] >> 16u);
+     if (ctx.gpr[8] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61240u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61244;
+     }
+     goto L_08B61244;
+@@ -3433,7 +3433,7 @@
+     { const std::uint32_t dividend = ctx.gpr[7]; const std::uint32_t divisor = ctx.gpr[8]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[14] & 65535u);
+     if (ctx.gpr[8] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B612A0u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B612A4;
+     }
+     goto L_08B612A4;
+@@ -3484,7 +3484,7 @@
+     ctx.gpr[5] = (ctx.gpr[10] >> 16u);
+     ctx.gpr[14] = (ctx.gpr[14] << (ctx.gpr[7] & 31u));
+     if (ctx.gpr[8] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61320u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61324;
+     }
+     goto L_08B61324;
+@@ -3534,7 +3534,7 @@
+     { const std::uint32_t dividend = ctx.gpr[7]; const std::uint32_t divisor = ctx.gpr[11]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[10] & 65535u);
+     if (ctx.gpr[11] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61388u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B6138C;
+     }
+     goto L_08B6138C;
+@@ -3654,7 +3654,7 @@
+     ctx.gpr[14] = (ctx.gpr[14] << (ctx.gpr[7] & 31u));
+     ctx.gpr[9] = (ctx.gpr[9] << (ctx.gpr[7] & 31u));
+     if (ctx.gpr[11] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B614A8u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B614AC;
+     }
+     goto L_08B614AC;
+@@ -3702,7 +3702,7 @@
+     { const std::uint32_t dividend = ctx.gpr[7]; const std::uint32_t divisor = ctx.gpr[11]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[10] & 65535u);
+     if (ctx.gpr[11] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61508u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B6150C;
+     }
+     goto L_08B6150C;
+@@ -3941,7 +3941,7 @@
+     ctx.gpr[10] = (ctx.gpr[11] & 65535u);
+     ctx.gpr[4] = (ctx.gpr[15] >> 16u);
+     if (ctx.gpr[6] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B6165Cu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61660;
+     }
+     goto L_08B61660;
+@@ -3981,7 +3981,7 @@
+     { const std::uint32_t dividend = ctx.gpr[5]; const std::uint32_t divisor = ctx.gpr[6]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[15] & 65535u);
+     if (ctx.gpr[6] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B616B4u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B616B8;
+     }
+     goto L_08B616B8;
+@@ -4058,7 +4058,7 @@
+     ctx.gpr[2] = (0u + static_cast<std::uint32_t>(1));
+     { const std::uint32_t dividend = ctx.gpr[2]; const std::uint32_t divisor = ctx.gpr[7]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     if (ctx.gpr[6] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B6174Cu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61750;
+     }
+     goto L_08B61750;
+@@ -4112,7 +4112,7 @@
+     { const std::uint32_t dividend = ctx.gpr[9]; const std::uint32_t divisor = ctx.gpr[8]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[15] >> 16u);
+     if (ctx.gpr[8] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B617CCu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B617D0;
+     }
+     goto L_08B617D0;
+@@ -4152,7 +4152,7 @@
+     { const std::uint32_t dividend = ctx.gpr[5]; const std::uint32_t divisor = ctx.gpr[8]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[15] & 65535u);
+     if (ctx.gpr[8] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61824u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61828;
+     }
+     goto L_08B61828;
+@@ -4199,7 +4199,7 @@
+     ctx.gpr[9] = (ctx.gpr[2] | ctx.gpr[3]);
+     ctx.gpr[5] = (ctx.gpr[9] >> 16u);
+     if (ctx.gpr[8] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B6189Cu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B618A0;
+     }
+     goto L_08B618A0;
+@@ -4242,7 +4242,7 @@
+     { const std::uint32_t dividend = ctx.gpr[10]; const std::uint32_t divisor = ctx.gpr[12]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[9] & 65535u);
+     if (ctx.gpr[12] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61900u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61904;
+     }
+     goto L_08B61904;
+@@ -4364,7 +4364,7 @@
+     ctx.gpr[9] = (ctx.gpr[3] | ctx.gpr[2]);
+     ctx.gpr[5] = (ctx.gpr[9] >> 16u);
+     if (ctx.gpr[12] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61A34u, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61A38;
+     }
+     goto L_08B61A38;
+@@ -4414,7 +4414,7 @@
+     { const std::uint32_t dividend = ctx.gpr[10]; const std::uint32_t divisor = ctx.gpr[12]; if (divisor == 0u) { ctx.lo = 0xFFFFFFFFu; ctx.hi = dividend; } else { ctx.lo = dividend / divisor; ctx.hi = dividend % divisor; } }
+     ctx.gpr[4] = (ctx.gpr[9] & 65535u);
+     if (ctx.gpr[12] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B61A9Cu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B61AA0;
+     }
+     goto L_08B61AA0;
+--- a/generated_unit_0216.cpp
++++ b/generated_unit_0216.cpp
+@@ -12365,7 +12365,7 @@
+     ctx.gpr[4] = (aot_mem.aot_load32(ctx.gpr[11] + static_cast<std::uint32_t>(60)));
+     ctx.gpr[5] = (aot_mem.aot_load32(ctx.gpr[11] + static_cast<std::uint32_t>(64)));
+     if (ctx.gpr[4] == 0u) {
+-    // break (unhandled trap; treated as a no-op)
++    rt.unsupported(0x08B6401Cu, 0x000001CDu, "special? not lowered yet"); return;
+         goto L_08B64020;
+     }
+     goto L_08B64020;
+--- a/generated_unit_0217.cpp
++++ b/generated_unit_0217.cpp
+@@ -3,6 +3,7 @@
+ #include <bit>
+ #include <cmath>
+ #include <cstdint>
++#include <cstdio>
+ #include <limits>
+ 
+ namespace psprecomp {
+@@ -9264,6 +9265,7 @@
+     return;
+ L_08B6B66C:
+     ctx.gpr[16] = (ctx.gpr[2] | 0u);
++    std::fprintf(stderr, "[diag-0217-660] alloc(6928)=0x%08X\n", ctx.gpr[16]);
+     { const bool branch_taken = ctx.gpr[16] == 0u;
+     // nop
+       if (branch_taken) {
+--- a/generated_unit_0222.cpp
++++ b/generated_unit_0222.cpp
+@@ -685,8 +685,7 @@
+     // nop
+     // nop
+     // nop
+-    { const bool signed_ok = ctx.execute_signed_add(0u, 0u, 0u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08B7D554u, 0x00000020u); return; } }
++    if (!ctx.execute_signed_add(0u, 0u, 0u)) { rt.arithmetic_overflow(0x08B7D554u, 0x00000020u); return; }
+     // nop
+     // nop
+     // nop
+--- a/generated_unit_0224.cpp
++++ b/generated_unit_0224.cpp
+@@ -635,8 +635,7 @@
+ L_08B87368:
+     rt.unsupported(0x08B87368u, 0x49544341u, "cop2/vfpu not lowered yet"); return;
+ L_08B87378:
+-    // break (unhandled trap; treated as a no-op)
+-    goto L_08B8737C;
++    rt.unsupported(0x08B87378u, 0x0000454Du, "special? not lowered yet"); return;
+ L_08B8737C:
+     rt.unsupported(0x08B8737Cu, 0x49544341u, "cop2/vfpu not lowered yet"); return;
+ L_08B87388:
+--- a/generated_unit_0225.cpp
++++ b/generated_unit_0225.cpp
+@@ -714,8 +714,7 @@
+     }
+     goto L_08B8872C;
+ L_08B8872C:
+-    // break (unhandled trap; treated as a no-op)
+-    rt.unsupported(0x08B88734u, 0x08B3CBD4u, "control flow in delay slot"); return;
++    rt.unsupported(0x08B8872Cu, 0x0000474Du, "special? not lowered yet"); return;
+ L_08B88740:
+     rt.unsupported(0x08B88744u, 0x08B3CEBCu, "control flow in delay slot"); return;
+ L_08B88760:
+@@ -860,15 +859,13 @@
+     goto L_08B88C28;
+ L_08B88C28:
+     (void)(static_cast<std::uint32_t>(static_cast<std::int32_t>(0u) >> 0u));
+-    { const bool signed_ok = ctx.execute_signed_add(0u, 0u, 0u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08B88C2Cu, 0x00000020u); return; } }
++    if (!ctx.execute_signed_add(0u, 0u, 0u)) { rt.arithmetic_overflow(0x08B88C2Cu, 0x00000020u); return; }
+     (void)(0u << 16u);
+     (void)(static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(aot_mem.aot_load8(0u + static_cast<std::uint32_t>(0))))));
+     goto L_08B88C38;
+ L_08B88C38:
+     (void)(static_cast<std::uint32_t>(static_cast<std::int32_t>(0u) >> 0u));
+-    { const bool signed_ok = ctx.execute_signed_add(0u, 0u, 0u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08B88C3Cu, 0x00000020u); return; } }
++    if (!ctx.execute_signed_add(0u, 0u, 0u)) { rt.arithmetic_overflow(0x08B88C3Cu, 0x00000020u); return; }
+     (void)(0u << 16u);
+     (void)(static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int8_t>(aot_mem.aot_load8(0u + static_cast<std::uint32_t>(0))))));
+     goto L_08B88C48;
+@@ -932,8 +929,7 @@
+ L_08B89050:
+     rt.unsupported(0x08B89050u, 0x20646142u, "unknown not lowered yet"); return;
+ L_08B8905C:
+-    { const bool signed_ok = ctx.execute_signed_sub(12u, 3u, 18u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08B8905Cu, 0x00726562u); return; } }
++    if (!ctx.execute_signed_sub(12u, 3u, 18u)) { rt.arithmetic_overflow(0x08B8905Cu, 0x00726562u); return; }
+     goto L_08B89060;
+ L_08B89060:
+     rt.unsupported(0x08B89060u, 0x63206F4Eu, "vfpu0 not lowered yet"); return;
+--- a/generated_unit_0231.cpp
++++ b/generated_unit_0231.cpp
+@@ -1218,8 +1218,7 @@
+     // nop
+     // nop
+     // nop
+-    { const bool signed_ok = ctx.execute_signed_add(4u, 0u, 0u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08BA10A0u, 0x00002020u); return; } }
++    if (!ctx.execute_signed_add(4u, 0u, 0u)) { rt.arithmetic_overflow(0x08BA10A0u, 0x00002020u); return; }
+     // nop
+     goto L_08BA10A8;
+ L_08BA10A8:
+@@ -1496,15 +1495,13 @@
+     if (0u != 0u) (void)(0u);
+     rt.unsupported(0x08BA1E10u, 0x0000000Cu, "syscall not lowered yet"); return;
+ L_08BA1E18:
+-    { const bool signed_ok = ctx.execute_signed_add(9u, 0u, 0u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08BA1E18u, 0x00004E20u); return; } }
++    if (!ctx.execute_signed_add(9u, 0u, 0u)) { rt.arithmetic_overflow(0x08BA1E18u, 0x00004E20u); return; }
+     goto L_08BA1E1C;
+ L_08BA1E1C:
+     ctx.gpr[4] = (ctx.hi);
+     ctx.pc = 0x08BA1E20u; return;
+ L_08BA1E30:
+-    { const bool signed_ok = ctx.execute_signed_add(5u, 0u, 0u);
+-      if (!signed_ok) { rt.arithmetic_overflow(0x08BA1E30u, 0x00002EE0u); return; } }
++    if (!ctx.execute_signed_add(5u, 0u, 0u)) { rt.arithmetic_overflow(0x08BA1E30u, 0x00002EE0u); return; }
+     goto L_08BA1E34;
+ L_08BA1E34:
+     { const std::int64_t product = static_cast<std::int64_t>(static_cast<std::int32_t>(0u)) * static_cast<std::int64_t>(static_cast<std::int32_t>(0u)); ctx.lo = static_cast<std::uint32_t>(product); ctx.hi = static_cast<std::uint32_t>(static_cast<std::uint64_t>(product) >> 32u); }
+@@ -1718,8 +1715,7 @@
+ L_08BA2A08:
+     rt.unsupported(0x08BA2A08u, 0x0000000Cu, "syscall not lowered yet"); return;
+ L_08BA2A14:
+-    // break (unhandled trap; treated as a no-op)
+-    rt.unsupported(0x08BA2A1Cu, 0x08BB0F70u, "control flow in delay slot"); return;
++    rt.unsupported(0x08BA2A14u, 0x0000000Du, "special? not lowered yet"); return;
+ L_08BA2A20:
+     rt.unsupported(0x08BA2A20u, 0x0000000Eu, "special? not lowered yet"); return;
+ L_08BA2A2C:
+@@ -1956,9 +1952,7 @@
+     rt.unsupported(0x08BA3694u, 0x00000035u, "special? not lowered yet"); return;
+     ctx.pc = 0x02ECBD00u; (void)rt.invoke_chained_call(ctx, &aot_mem_ref); return;
+ L_08BA3858:
+-    // break (unhandled trap; treated as a no-op)
+-    { const std::uint64_t product = static_cast<std::uint64_t>(0u) * static_cast<std::uint64_t>(0u); ctx.lo = static_cast<std::uint32_t>(product); ctx.hi = static_cast<std::uint32_t>(product >> 32u); }
+-    rt.unsupported(0x08BA3860u, 0x000000BBu, "special? not lowered yet"); return;
++    rt.unsupported(0x08BA3858u, 0x000000CDu, "special? not lowered yet"); return;
+ L_08BA3874:
+     rt.unsupported(0x08BA3874u, 0x000000FEu, "special? not lowered yet"); return;
+ L_08BA38B8:

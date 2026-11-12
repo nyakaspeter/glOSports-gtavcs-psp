@@ -5,7 +5,8 @@
 #      next to VCSNative, presses Cross through the intro movies and the
 #      opening cutscene of a new game (VCS_BENCH_NEW_GAME: the save is not
 #      loaded) with padpress, as the benchmark (don't touch the
-#      controls), walks around the barracks for ~60 s, then SIGUSR1 makes it
+#      controls), walks around the barracks for ~60 s, moves the player along
+#      a busy street for 90 s (as tools/street-bench.sh), then SIGUSR1 makes it
 #      write its profile, which is fetched into pgo/ over MTP
 #   3. ./build.sh && ./package.sh   (PGO=use is the default once pgo/ has a profile)
 # Re-train after big code changes; a stale profile still builds, just helps less.
@@ -21,6 +22,12 @@ case "${1:-}" in
 train)
     tmp=$(mktemp -d)
     cp "$HERE/$OUT/gtavcs-psp/VCSNative" "$tmp/VCSNative.pgo"
+    # The street part of the training: the player ped's position (guest
+    # 0x098B0930, see street-bench.sh) written along the avenue through Little
+    # Havana and back, 40 m every 6 s.
+    hops=$(python3 -c 'import struct
+for k in list(range(0, 8)) + list(range(6, -1, -1)):
+    print("\x27" + "".join("\\%03o" % b for b in struct.pack("<3f", -800 - 3 * k, -500 + 40 * k, 12.5)) + "\x27")' | tr '\n' ' ')
     # appctl stop-application returns before the game has exited; a launch
     # sent meanwhile is killed by the late shutdown.
     console "/usr/local/bin/appctl stop-application; w=0; while pidof VCSNative VCSNative.pgo >/dev/null && [ \$w -lt 30 ]; do sleep 1; w=\$((w+1)); done; rm -f /home/player/VCSNative.pgo /home/player/vcspgo.tar"
@@ -29,7 +36,7 @@ train)
     if ! console "ls /home/player/VCSNative.pgo" | grep -q VCSNative.pgo; then
         echo "pgo.sh: VCSNative.pgo did not reach the console (MTP busy? quit Photos / kill ptpcamerad)" >&2; rm -rf "$tmp"; exit 1
     fi
-    T=900 console "cd /home/player/ports/gtavcs-psp && mv /home/player/VCSNative.pgo . && chmod +x VCSNative.pgo && rm -rf /dev/shm/vcspgo
+    T=1500 console "cd /home/player/ports/gtavcs-psp && mv /home/player/VCSNative.pgo . && chmod +x VCSNative.pgo && rm -rf /dev/shm/vcspgo
 sed 's|\./VCSNative |./VCSNative.pgo |' start.sh > start.pgo.sh; chmod +x start.pgo.sh
 sleep 6; rm -f /dev/shm/vcs.log
 # The first launch after the launcher has started is often killed by an appd
@@ -39,6 +46,8 @@ P=/home/player/ports/gtavcs-psp/glos/testing/padpress; sleep 20; i=0
 while [ \$i -lt 150 ]; do grep 'glos: FPS' /dev/shm/vcs.log | tail -1 | awk 'BEGIN {r=1} {r=!(\$5 > 200)} END {exit r}' && break; \$P a 600; sleep 2; i=\$((i+1)); done
 echo \"3D after \$i presses\"; j=0; while [ \$j -lt 18 ]; do \$P a 600; sleep 2; j=\$((j+1)); done
 k=0; while [ \$k -lt 6 ]; do \$P stick y 0 4000; \$P stick rx 255 1500; \$P stick x 255 2000; sleep 2; k=\$((k+1)); done; sleep 10
+p=\$(pidof VCSNative.pgo); m=\$(grep -m1 psprecomp-vram /proc/\$p/maps | cut -d- -f1); seek=\$((0x\$m - 0x04000000 + 0x098B0930))
+for h in $hops; do printf \"\$h\" | dd of=/proc/\$p/mem bs=1 seek=\$seek conv=notrunc 2>/dev/null; sleep 6; done; grep 'glos: FPS' /dev/shm/vcs.log | tail -1
 kill -USR1 \$(pidof VCSNative.pgo); sleep 25; pidof VCSNative.pgo && echo 'still running?'
 ls /dev/shm/vcspgo | wc -l; du -sh /dev/shm/vcspgo
 cd /dev/shm/vcspgo && tar cf /home/player/vcspgo.tar . && ls -la /home/player/vcspgo.tar; rm -rf /dev/shm/vcspgo; rm -f /home/player/ports/gtavcs-psp/VCSNative.pgo /home/player/ports/gtavcs-psp/start.pgo.sh"
